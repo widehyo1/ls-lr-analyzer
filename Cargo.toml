@@ -1,0 +1,14 @@
+[package]
+name = "ls-lr-analyzer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Analyze ls -lR text snapshots and compare directory sizes, file counts, and growth."
+repository = "https://github.com/widehyo1/ls-lr-analyzer"
+readme = "README.md"
+license = "MIT"
+keywords = ["ls", "snapshot", "disk-usage", "filesystem", "cli"]
+categories = ["command-line-utilities", "filesystem"]
+include = ["Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "src/**", "tests/**"]
+
+[dependencies]
