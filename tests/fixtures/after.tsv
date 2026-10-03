@@ -1,0 +1,12 @@
+record	directory	permissions	links	owner	group	size_or_device	month	day	time_or_year	name	total
+directory	.										
+total	.										4
+entry	.	-rw-r--r--	1	u	g	100	Sep	28	12:00	stable.txt	
+directory	./new										
+total	./new										4
+entry	./new	-rw-r--r--	1	u	g	50	Oct	1	12:00	added.txt	
+directory	./growing										
+total	./growing										8
+entry	./growing	-rw-r--r--	1	u	g	0	Oct	1	12:00	zero size.txt	
+entry	./growing	-rw-r--r--	1	u	g	400	Oct	1	12:00	new.log	
+entry	./growing	-rw-r--r--	1	u	g	2000	Oct	1	12:00	database.db	

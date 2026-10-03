@@ -1,6 +1,6 @@
 [package]
 name = "ls-lr-analyzer"
-version = "0.1.0"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.97"
 description = "Analyze ls -lR text snapshots and compare directory sizes, file counts, and growth."
@@ -9,6 +9,12 @@ readme = "README.md"
 license = "MIT"
 keywords = ["ls", "snapshot", "disk-usage", "filesystem", "cli"]
 categories = ["command-line-utilities", "filesystem"]
-include = ["Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "src/**", "tests/**"]
+include = ["Cargo.toml", "Cargo.lock", "README.md", "CHANGELOG.md", "docs/**", "LICENSE", "src/**", "tests/**"]
 
 [dependencies]
+
+[features]
+default = []
+sqlite = []
+duckdb = []
+parquet = []

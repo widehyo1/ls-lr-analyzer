@@ -1,0 +1,12 @@
+record	directory	permissions	links	owner	group	size_or_device	month	day	time_or_year	name	total
+directory	.										
+total_bytes	.										4096
+entry	.	-rw-r--r--	1	1000	1000	100	epoch	1759060800.0000000000	find	stable.txt	
+directory	./growing										
+total_bytes	./growing										8192
+entry	./growing	-rw-r--r--	1	1000	1000	0	epoch	1759320000.0000000000	find	zero size.txt	
+entry	./growing	-rw-r--r--	1	1000	1000	400	epoch	1759320000.0000000000	find	new.log	
+entry	./growing	-rw-r--r--	1	1000	1000	2000	epoch	1759320000.0000000000	find	database.db	
+directory	./new										
+total_bytes	./new										4096
+entry	./new	-rw-r--r--	1	1000	1000	50	epoch	1759320000.0000000000	find	added.txt	
