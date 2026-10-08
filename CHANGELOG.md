@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.4
+
+- Replace full find path/metadata collections with bounded-memory external sorting.
+- Stream report metadata without retaining all files in a directory or the before snapshot.
+- Merge-join normalized relative paths for exact additions, removals, and metadata changes.
+- Accumulate totals and retain bounded top-K rankings; reduce path groups on disk.
+- Preserve export schemas, entry order, duplicate/parent validation, and report tie ordering.
+- Bound backend diagnostics and configure DuckDB working memory and disk spill.
+- Add multi-run comparison, grouping, validation, and temporary cleanup regression tests.
+- Add a real-snapshot baseline/target RSS and output comparison script.
+
 ## 0.1.3
 
 - Read saved GNU find snapshots; document source-machine collection commands.

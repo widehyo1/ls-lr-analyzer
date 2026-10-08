@@ -73,9 +73,17 @@ pub fn export_tsv_file(input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-fn export_rows(
+pub(crate) fn export_rows(
+    reader: impl BufRead,
+    emit: impl FnMut(&[&str; 12]) -> Result<()>,
+) -> Result<()> {
+    rows(reader, emit, false)
+}
+
+pub(crate) fn rows(
     mut reader: impl BufRead,
     mut emit: impl FnMut(&[&str; 12]) -> Result<()>,
+    report: bool,
 ) -> Result<()> {
     if reader
         .fill_buf()?
@@ -130,7 +138,7 @@ fn export_rows(
         } else if line.starts_with("total ") || line.starts_with("합계 ") {
             if let Some(total) = line.split_whitespace().nth(1)
                 && total.parse::<u64>().is_ok()
-                && line.split_whitespace().count() == 2
+                && (report || line.split_whitespace().count() == 2)
             {
                 row[0] = "total";
                 row[11] = total;
@@ -154,7 +162,7 @@ fn export_rows(
         row[1] = &directory;
         emit(&row)?;
     }
-    if warnings != 0 {
+    if warnings != 0 && !report {
         eprintln!("Warning: {warnings} ls error or unparsed lines preserved in export");
     }
     Ok(())

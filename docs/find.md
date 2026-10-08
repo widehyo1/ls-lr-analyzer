@@ -65,5 +65,7 @@ input format and need no find options.
 - This is not an atomic snapshot or a content/ACL integrity check. Hard links,
   shared extents, sparse files and deleted open files limit physical-usage
   conclusions. Symlink-target changes are retained but not analyzed.
-- Normalization groups metadata in memory and stages normalized TSV in the
-  system temporary directory. Plan memory and temporary space for large files.
+- Normalization validates and groups metadata using bounded-memory external
+  sorting, then stages normalized TSV in the system temporary directory.
+  Entries retain their source order within each directory. Set `TMPDIR` to
+  a disk-backed location with enough free space for large snapshots.

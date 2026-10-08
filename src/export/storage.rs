@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 
 use super::temp::Staging;
 use super::{EXPORT_COLUMNS, export_rows};
@@ -15,22 +15,46 @@ fn client(binary: &Path, init: &Path) -> Command {
     command
 }
 
+// Client output can be arbitrarily large on failures. Spool it to disk and
+// retain only a diagnostic prefix, rather than Command::output's unbounded Vec.
+fn diagnostic(path: &Path) -> Result<String> {
+    let mut bytes = Vec::new();
+    File::open(path)?.take(16 * 1024).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).trim().into())
+}
+
+fn execute(mut command: Command, directory: &Path) -> Result<(ExitStatus, String, String)> {
+    let stdout = directory.join("client.stdout");
+    let stderr = directory.join("client.stderr");
+    let status = command
+        .stdout(File::create(&stdout)?)
+        .stderr(File::create(&stderr)?)
+        .status()?;
+    Ok((status, diagnostic(&stdout)?, diagnostic(&stderr)?))
+}
+
 fn check_client(binary: &Path, init: &Path, query: &str) -> Result<()> {
-    let result = client(binary, init)
+    let mut command = client(binary, init);
+    command
         .args(["-csv", "-noheader", ":memory:", query])
-        .stdin(Stdio::null())
-        .output()
+        .stdin(Stdio::null());
+    let (status, stdout, stderr) = execute(command, init.parent().unwrap())
         .map_err(|e| format!("Cannot execute {}: {e}", binary.display()))?;
-    if !result.status.success() || String::from_utf8_lossy(&result.stdout).trim() != "42" {
+    if !status.success() || stdout != "42" {
         return Err(format!(
-            "{} capability check failed: {} {}",
-            binary.display(),
-            result.status,
-            String::from_utf8_lossy(&result.stderr).trim()
+            "{} capability check failed: {status} {stderr}",
+            binary.display()
         )
         .into());
     }
     Ok(())
+}
+
+fn duckdb_settings(directory: &Path) -> Result<String> {
+    Ok(format!(
+        "SET memory_limit='64MiB'; SET threads=1; SET temp_directory={}; ",
+        sql_path(directory)?
+    ))
 }
 
 fn sql_path(path: &Path) -> Result<String> {
@@ -112,18 +136,11 @@ pub fn export(options: &Options) -> Result<()> {
     let database = stage.0.join("snapshot.db");
     script.flush()?;
     drop(script);
-    let result = client(binary, &init)
-        .arg(&database)
-        .stdin(File::open(&sql)?)
-        .output()?;
-    if !result.status.success() {
-        return Err(format!(
-            "{} export failed: {} {}",
-            binary.display(),
-            result.status,
-            String::from_utf8_lossy(&result.stderr).trim()
-        )
-        .into());
+    let mut command = client(binary, &init);
+    command.arg(&database).stdin(File::open(&sql)?);
+    let (status, _, stderr) = execute(command, &stage.0)?;
+    if !status.success() {
+        return Err(format!("{} export failed: {status} {stderr}", binary.display()).into());
     }
     // Both paths are on the same filesystem. Linking publishes the finished
     // artifact atomically and refuses to overwrite a concurrently created file.
@@ -179,24 +196,20 @@ fn export_parquet(
             sql_path(&rows)?
         )
     };
-    let result = client(binary, init)
+    let mut command = client(binary, init);
+    command
         .args([
             ":memory:",
             &format!(
-                "COPY ({query}) TO {} (FORMAT PARQUET);",
+                "{}COPY ({query}) TO {} (FORMAT PARQUET);",
+                duckdb_settings(&stage.0)?,
                 sql_path(&artifact)?
             ),
         ])
-        .stdin(Stdio::null())
-        .output()?;
-    if !result.status.success() {
-        return Err(format!(
-            "{} export failed: {} {}",
-            binary.display(),
-            result.status,
-            String::from_utf8_lossy(&result.stderr).trim()
-        )
-        .into());
+        .stdin(Stdio::null());
+    let (status, _, stderr) = execute(command, &stage.0)?;
+    if !status.success() {
+        return Err(format!("{} export failed: {status} {stderr}", binary.display()).into());
     }
     fs::hard_link(artifact, output)?;
     Ok(())
@@ -244,7 +257,14 @@ pub fn read_rows(path: &Path, options: &Options) -> Result<Box<dyn BufRead>> {
         .map(|column| format!("hex(\"{column}\")"))
         .collect::<Vec<_>>()
         .join(" || '\t' || ");
-    let query = format!("SELECT {columns} FROM {table} ORDER BY row_index;");
+    let query = format!(
+        "{}SELECT {columns} FROM {table} ORDER BY row_index;",
+        if sqlite {
+            String::new()
+        } else {
+            duckdb_settings(&stage.0)?
+        }
+    );
     let rows = stage.0.join("rows.hex");
     let errors = stage.0.join("stderr.txt");
     let mut command = client(binary, &init);
@@ -265,7 +285,7 @@ pub fn read_rows(path: &Path, options: &Options) -> Result<Box<dyn BufRead>> {
         return Err(format!(
             "{} read failed: {status} {}",
             binary.display(),
-            fs::read_to_string(errors)?.trim()
+            diagnostic(&errors)?
         )
         .into());
     }

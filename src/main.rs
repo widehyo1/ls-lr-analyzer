@@ -1,32 +1,17 @@
 use std::fs::File;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufReader, Write};
 mod cli;
 mod export;
 mod find;
 mod input;
 mod report;
+mod sort;
+mod top;
 
 use cli::{Options, options};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-#[derive(Debug)]
-struct Entry {
-    name: Box<str>,
-    size: u64,
-    mtime: u64,
-    attrs: u64,
-}
-
-#[derive(Debug, Default)]
-struct Section {
-    path: String,
-    files: Vec<Entry>,
-    blocks: u64,
-    has_total: bool,
-    symlinks: u64,
-}
 
 #[derive(Default)]
 struct Diagnostics {
@@ -99,138 +84,6 @@ fn is_merged(path: &str) -> bool {
     parts
         .windows(5)
         .any(|p| p[0] == "containers" && p[1] == "storage" && p[2] == "overlay" && p[4] == "merged")
-}
-
-struct Listing<R> {
-    reader: R,
-    pending: Option<String>,
-    root: Option<String>,
-    line: String,
-    diagnostics: Diagnostics,
-    block_size: u64,
-    include_merged: bool,
-}
-
-impl<R: BufRead> Listing<R> {
-    fn new(reader: R, block_size: u64, include_merged: bool) -> Self {
-        Self {
-            reader,
-            pending: None,
-            root: None,
-            line: String::new(),
-            diagnostics: Diagnostics::default(),
-            block_size,
-            include_merged,
-        }
-    }
-    fn read(&mut self) -> Result<bool> {
-        self.line.clear();
-        Ok(self.reader.read_line(&mut self.line)? != 0)
-    }
-    fn invalid(&mut self, line: &str) {
-        self.diagnostics.malformed += 1;
-        if self.diagnostics.examples.len() < 3 {
-            self.diagnostics.examples.push(line.to_owned());
-        }
-    }
-    fn next_section(&mut self) -> Result<Option<Section>> {
-        loop {
-            let raw = if let Some(p) = self.pending.take() {
-                p
-            } else {
-                loop {
-                    if !self.read()? {
-                        return Ok(None);
-                    }
-                    let line = self.line.trim_end_matches(['\n', '\r']);
-                    if let Some(p) = header(line) {
-                        break p.to_owned();
-                    }
-                    if !line.is_empty() {
-                        let line = line.to_owned();
-                        if line.starts_with("ls:") {
-                            self.diagnostics.errors += 1;
-                        } else {
-                            self.invalid(&line);
-                        }
-                    }
-                }
-            };
-            let root = self.root.get_or_insert_with(|| raw.clone());
-            let mut section = Section {
-                path: relative(root, &raw)?,
-                ..Default::default()
-            };
-            let excluded = !self.include_merged && is_merged(&raw);
-            while self.read()? {
-                let line = self.line.trim_end_matches(['\n', '\r']);
-                if line.is_empty() {
-                    continue;
-                }
-                // File records take precedence: names can themselves end in ':'.
-                let file_type = line.as_bytes()[0];
-                if permissions_record(line) {
-                    match file_type {
-                        b'-' => {
-                            if let Some((f, name)) = fields(line)
-                                && let Ok(size) = f[4].parse::<u64>()
-                            {
-                                if excluded {
-                                    self.diagnostics.excluded_files += 1;
-                                    self.diagnostics.excluded_bytes += size;
-                                } else {
-                                    section.files.push(Entry {
-                                        name: name.into(),
-                                        size,
-                                        mtime: signature(&f[5..8]),
-                                        attrs: signature(&f[..4]),
-                                    });
-                                }
-                                continue;
-                            }
-                            let line = line.to_owned();
-                            self.invalid(&line);
-                        }
-                        b'l' => section.symlinks += 1,
-                        _ => (),
-                    }
-                } else if line.starts_with("\u{d569}\u{acc4} ") || line.starts_with("total ") {
-                    if let Some(total) = line
-                        .split_whitespace()
-                        .nth(1)
-                        .and_then(|n| n.parse::<u64>().ok())
-                        .and_then(|n| n.checked_mul(self.block_size))
-                    {
-                        section.blocks = total;
-                        section.has_total = true;
-                    } else {
-                        let line = line.to_owned();
-                        self.invalid(&line);
-                    }
-                } else if let Some(p) = header(line) {
-                    self.pending = Some(p.to_owned());
-                    break;
-                } else if line.starts_with("ls:") {
-                    self.diagnostics.errors += 1;
-                } else {
-                    let line = line.to_owned();
-                    self.invalid(&line);
-                }
-            }
-            if excluded {
-                self.diagnostics.excluded_dirs += 1;
-                continue;
-            }
-            if !section.has_total {
-                self.diagnostics.missing_total += 1;
-            }
-            section.files.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-            if section.files.windows(2).any(|p| p[0].name == p[1].name) {
-                return Err(format!("Duplicate filename in directory: {}", section.path).into());
-            }
-            return Ok(Some(section));
-        }
-    }
 }
 
 fn run() -> Result<()> {

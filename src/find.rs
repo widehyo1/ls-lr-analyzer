@@ -1,16 +1,11 @@
 //! Decode saved GNU find snapshots; never inspect the collection filesystem.
 use crate::export::{EXPORT_COLUMNS, temp::Staging, tsv_row};
+use crate::sort::{self, Record, Sorter};
 use crate::{Result, permissions_record};
-use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 type Row = [String; 12];
-#[derive(Default)]
-struct Directory {
-    total: u64,
-    rows: Vec<Row>,
-}
 pub fn snapshot(path: &Path) -> Result<Staging> {
     let input = BufReader::new(File::open(path)?);
     let stage = Staging::new(&std::env::temp_dir())?;
@@ -21,84 +16,132 @@ pub fn snapshot(path: &Path) -> Result<Staging> {
 }
 
 pub fn normalize(mut reader: impl BufRead, writer: &mut impl Write) -> Result<()> {
-    let mut directories: BTreeMap<String, Directory> = BTreeMap::new();
-    let mut root_seen = false;
-    let mut seen = BTreeSet::new();
-    let mut directory_records = BTreeSet::new();
+    let mut paths = Sorter::new()?;
+    let mut ordinal = 0_u64;
     while let Some(cells) = read_record(&mut reader)? {
-        let path = &cells[0];
         validate(&cells)?;
-        if cells[1] == "d" {
-            directory_records.insert(path.clone());
+        if ordinal == 0 && (!cells[0].is_empty() || cells[1] != "d") {
+            return Err("Find root must be the first directory record".into());
         }
-        if !seen.insert(path.clone()) {
+        paths.push(Record {
+            key: (cells[0].clone(), format!("{ordinal:020}")),
+            data: cells.join("\0").into_bytes(),
+        })?;
+        ordinal = ordinal.checked_add(1).ok_or("find record count overflow")?;
+    }
+    if ordinal == 0 {
+        return Err("Missing find root record".into());
+    }
+    let mut paths = paths.finish()?;
+    let mut groups = Sorter::new()?;
+    let mut previous = None;
+    while let Some(record) = paths.next()? {
+        if previous.as_ref() == Some(&record.key.0) {
             return Err("Duplicate find path".into());
         }
-        if !root_seen && !path.is_empty() {
-            return Err("Find root must be the first record".into());
+        previous = Some(record.key.0.clone());
+        let text = String::from_utf8(record.data)?;
+        let cells: Vec<_> = text.split('\0').collect();
+        let path = &record.key.0;
+        if cells[1] == "d" {
+            groups.push(Record {
+                key: (path.clone(), String::new()),
+                data: Vec::new(),
+            })?;
         }
         if path.is_empty() {
-            if root_seen || cells[1] != "d" {
-                return Err("Invalid find root record".into());
-            }
-            root_seen = true;
-            directories.entry(String::new()).or_default();
             continue;
         }
         let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
-        if cells[1] == "d" {
-            directories.entry(path.clone()).or_default();
-        }
         let blocks = cells[3]
             .parse::<u64>()?
             .checked_mul(512)
             .ok_or("find block overflow")?;
-        let directory = directories.entry(parent.into()).or_default();
-        directory.total = directory
-            .total
-            .checked_add(blocks)
-            .ok_or("find total overflow")?;
         let mut row: Row = std::array::from_fn(|_| String::new());
         row[0] = "entry".into();
         row[1] = snapshot_directory(parent);
-        row[2..7].clone_from_slice(&[
-            cells[4].clone(),
-            cells[5].clone(),
-            cells[6].clone(),
-            cells[7].clone(),
-            cells[2].clone(),
-        ]);
+        for (to, from) in [(2, 4), (3, 5), (4, 6), (5, 7), (6, 2)] {
+            row[to] = cells[from].into();
+        }
         row[7] = "epoch".into();
-        row[8].clone_from(&cells[8]);
+        row[8] = cells[8].into();
         row[9] = "find".into();
         row[10] = if cells[1] == "l" {
             format!("{name} -> {}", cells[9])
         } else {
             name.into()
         };
-        directory.rows.push(row);
+        let mut data = blocks.to_le_bytes().to_vec();
+        data.extend_from_slice(row.join("\0").as_bytes());
+        groups.push(Record {
+            key: (parent.into(), record.key.1),
+            data,
+        })?;
     }
-    if !root_seen {
-        return Err("Missing find root record".into());
-    }
-    for path in directories.keys().filter(|path| !path.is_empty()) {
-        if !directory_records.contains(path) {
-            return Err("Missing find directory record".into());
+    drop(paths);
+    let mut groups = groups.finish()?;
+    // First pass validates directory existence and reduces direct-child totals.
+    // A second pass emits totals before entries without buffering a directory.
+    let stage = Staging::new(&std::env::temp_dir())?;
+    let totals_path = stage.0.join("totals");
+    let mut totals = BufWriter::new(File::create(&totals_path)?);
+    let mut current = None;
+    let mut total = 0_u64;
+    while let Some(record) = groups.next()? {
+        if current.as_ref() != Some(&record.key.0) {
+            if let Some(path) = current.take() {
+                sort::write_record(
+                    &mut totals,
+                    &Record {
+                        key: (path, String::new()),
+                        data: total.to_le_bytes().to_vec(),
+                    },
+                )?;
+            }
+            if !record.key.1.is_empty() {
+                return Err("Missing find directory record".into());
+            }
+            current = Some(record.key.0);
+            total = 0;
+        } else {
+            let blocks = u64::from_le_bytes(record.data[..8].try_into()?);
+            total = total.checked_add(blocks).ok_or("find total overflow")?;
         }
     }
+    if let Some(path) = current {
+        sort::write_record(
+            &mut totals,
+            &Record {
+                key: (path, String::new()),
+                data: total.to_le_bytes().to_vec(),
+            },
+        )?;
+    }
+    totals.flush()?;
+    drop(totals);
+    let mut totals = BufReader::new(File::open(totals_path)?);
+    groups.rewind()?;
     tsv_row(writer, &EXPORT_COLUMNS)?;
-    for (path, directory) in directories {
-        let path = snapshot_directory(&path);
-        let mut header = [""; 12];
-        header[0] = "directory";
-        header[1] = &path;
-        tsv_row(writer, &header)?;
-        header[0] = "total_bytes";
-        let total = directory.total.to_string();
-        header[11] = &total;
-        tsv_row(writer, &header)?;
-        for row in directory.rows {
-            tsv_row(writer, &std::array::from_fn(|i| row[i].as_str()))?;
+    while let Some(record) = groups.next()? {
+        if record.key.1.is_empty() {
+            let total =
+                sort::read_record(&mut totals)?.ok_or("Missing temporary directory total")?;
+            let path = snapshot_directory(&record.key.0);
+            let mut header = [""; 12];
+            header[0] = "directory";
+            header[1] = &path;
+            tsv_row(writer, &header)?;
+            header[0] = "total_bytes";
+            let bytes = u64::from_le_bytes(total.data[..8].try_into()?).to_string();
+            header[11] = &bytes;
+            tsv_row(writer, &header)?;
+        } else {
+            let text = std::str::from_utf8(&record.data[8..])?;
+            let cells: Vec<_> = text.split('\0').collect();
+            tsv_row(
+                writer,
+                &cells.try_into().map_err(|_| "Invalid temporary find row")?,
+            )?;
         }
     }
     Ok(())

@@ -184,7 +184,9 @@ and an unambiguous tab separator, even for filenames containing tabs. The source
 listing must still use the supported ordinary `ls -lR` format; filenames with
 newlines cannot be recovered from that format.
 
-Export includes all entries in source order, including overlay merged views.
+Export includes all entries, including overlay merged views. ls entries retain
+source order. Find exports sort directory groups by path and retain source order
+within each directory.
 Report options (`--depth`, `--top`, `--block-size`, `--include-merged`) are applied
 when producing reports, and are rejected by the explicit `export` command.
 `ls_error` and `unparsed` rows preserve problematic input lines in `name`, with
@@ -244,8 +246,9 @@ DuckDB database export is no longer offered. Existing DuckDB snapshots remain
 readable with the `duckdb` feature. Parquet export bulk-loads a temporary
 hex-encoded TSV in DuckDB's `:memory:` database, then writes Parquet directly;
 it does not create a database file or issue per-row INSERT statements. The
-temporary TSV still requires disk space, and DuckDB may spill to disk under
-memory pressure.
+temporary TSV still requires disk space. DuckDB export and report queries use
+a 64 MiB working-memory limit, one worker thread, and a temporary spill directory.
+This limit does not include all of DuckDB's process overhead.
 SQLite export uses temporary SQL and a staged database; Parquet uses a staged
 hex-encoded TSV and Parquet file beside the destination. Allow disk space for
 these intermediate files. The
@@ -260,7 +263,7 @@ No new third-party crates are used for these formats.
 
 Reports open database inputs read-only. Database and Parquet rows are transferred
 through a temporary file in the system temporary directory; metadata is then
-processed directory by directory. The same analysis and report renderer are used
+externally sorted and processed record by record. The same analysis and report renderer are used
 for original listings and all intermediate formats. Export preserves block
 totals in their original units, so supply the same `--block-size` when reporting
 ls source or exported data; find's `total_bytes` records need no unit option.
@@ -326,9 +329,46 @@ The tool reports paths and measurements rather than guessing service categories.
   `du`, and file counts are not exact inode counts.
 - Only `containers/storage/overlay/<ID>/merged` and its descendants are excluded
   by default. Including these unified views can double-count storage layers.
-- Analysis reads listing text, never the underlying file contents. Comparison
-  keeps before-file metadata in memory; usage scales with file count and name
-  length. A single snapshot is read directory by directory.
+- Analysis reads listing text, never the underlying file contents. Both capacity
+  and comparison reports use bounded sort buffers and stream records; neither
+  keeps all files, directories, or path groups in memory. Renamed paths count
+  as removal plus addition; snapshots cannot establish file identity.
+
+## Memory and temporary storage
+
+Find normalization, report input, and path-group aggregation use external
+sorting with an 8 MiB record buffer per active sorter and at most 16 input files
+per merge. Totals are accumulated as counters; rankings retain only `--top`
+values. Comparison merge-joins records by relative directory and filename, even
+when snapshot directory order or root labels differ. Empty directories and
+duplicate-path validation are preserved.
+
+The buffer budget is not a hard RSS limit: allocator overhead, merge readers,
+the largest individual record, and the selected `--top` also require memory.
+Temporary disk usage scales with input size. Choose a disk-backed temporary
+directory with enough free space; a tmpfs uses system RAM:
+
+```bash
+TMPDIR=/path/to/disk/tmp ls-lr-analyzer --input-format find before.find after.find
+```
+
+Temporary analysis files are removed on success and ordinary errors. SIGKILL
+cannot run cleanup; remove abandoned `.ls-lr-analyzer-*` directories after
+confirming their processes have exited. File export staging remains beside the
+destination so publication can use a hard link without overwriting a file.
+
+To compare an installed baseline and a release build on a record-aligned tenth
+of an actual find snapshot (Python 3 and GNU `/usr/bin/time` required):
+
+```bash
+cargo build --release --all-features
+python3 scripts/compare-memory.py snapshot.find --target target/release/ls-lr-analyzer
+```
+
+The script runs the two binaries serially, compares exact capacity and
+self-comparison report bytes, and records maximum RSS and elapsed time.
+The prefix follows collection order; it is a workload sample, not a random
+sample or a measurement of the full snapshot's capacity.
 
 ## Project
 
