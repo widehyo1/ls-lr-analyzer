@@ -6,6 +6,22 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+pub fn is_stdin(path: &Path) -> bool {
+    path == Path::new("-")
+}
+
+/// Text and raw find inputs share a buffered reader without staging stdin.
+pub fn open(path: &Path) -> Result<Box<dyn BufRead>> {
+    if is_stdin(path) {
+        Ok(Box::new(std::io::stdin().lock()))
+    } else {
+        Ok(Box::new(BufReader::with_capacity(
+            256 * 1024,
+            File::open(path)?,
+        )))
+    }
+}
+
 pub fn numbers<const N: usize>(data: &[u8]) -> Result<[u64; N]> {
     if data.len() != N * 8 {
         return Err("Invalid temporary numeric record".into());
@@ -174,6 +190,23 @@ impl Scan<'_> {
 }
 
 pub fn snapshot(path: &Path, options: &Options) -> Result<Snapshot> {
+    let hex = !matches!(options.input_format.as_str(), "ls" | "tsv");
+    let reader = if hex {
+        #[cfg(any(feature = "sqlite", feature = "duckdb", feature = "parquet"))]
+        {
+            crate::export::read_rows(path, options)?
+        }
+        #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "parquet")))]
+        {
+            return Err("Database formats were not enabled at installation".into());
+        }
+    } else {
+        open(path)?
+    };
+    snapshot_reader(reader, options, hex)
+}
+
+fn snapshot_reader(mut reader: impl BufRead, options: &Options, hex: bool) -> Result<Snapshot> {
     let mut scan = Scan {
         sorter: Sorter::new()?,
         root: None,
@@ -183,25 +216,8 @@ pub fn snapshot(path: &Path, options: &Options) -> Result<Snapshot> {
         options,
     };
     if options.input_format == "ls" {
-        crate::export::rows(
-            BufReader::with_capacity(256 * 1024, File::open(path)?),
-            |row| scan.row(row),
-            true,
-        )?;
+        crate::export::rows(reader, |row| scan.row(row), true)?;
     } else {
-        let hex = options.input_format != "tsv";
-        let mut reader: Box<dyn BufRead> = if hex {
-            #[cfg(any(feature = "sqlite", feature = "duckdb", feature = "parquet"))]
-            {
-                crate::export::read_rows(path, options)?
-            }
-            #[cfg(not(any(feature = "sqlite", feature = "duckdb", feature = "parquet")))]
-            {
-                return Err("Database formats were not enabled at installation".into());
-            }
-        } else {
-            Box::new(BufReader::new(File::open(path)?))
-        };
         let mut line = String::new();
         if !hex {
             reader.read_line(&mut line)?;

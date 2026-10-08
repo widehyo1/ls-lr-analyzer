@@ -1,17 +1,41 @@
 # ls-lr-analyzer
 
-A command-line tool for finding directory growth in saved GNU `ls -lR` listings.
-Analyze one snapshot for capacity, or compare two snapshots for changes in file
-sizes, file counts, timestamps, and directory block totals. Reports are plain
-text for people by default. Export a snapshot as TSV for a portable intermediate
-artifact that can be read without database or columnar-format tools.
+A command-line tool for analyzing and comparing **filesystem metadata snapshots**.
+Read one snapshot to understand the distribution of file sizes and directory
+capacity, or compare two snapshots to find additions, removals, growth,
+shrinkage, and metadata changes.
+
+Snapshots can be collected as GNU `find` records or `ls -lR` listings, then
+analyzed on another machine without access to the original filesystem. Input
+can come from a saved file or stdin. The tool produces human-readable reports
+and exports reusable metadata artifacts as TSV, SQLite, or Parquet.
+
+Analysis uses streaming input, bounded sort buffers, disk-backed comparison,
+and top-K rankings so large snapshots can be processed without retaining every
+file or directory in memory.
 
 ## Quickstart
 
-Install from crates.io, then compare two listings:
+Install the tool and analyze snapshots collected in the
+[find snapshot format](docs/find.md):
 
 ```bash
 cargo install ls-lr-analyzer
+
+# Understand one filesystem snapshot.
+ls-lr-analyzer report --input-format find snapshot.find
+
+# Compare the same filesystem scope at two points in time.
+ls-lr-analyzer report --input-format find before.find after.find
+
+# Analyze a snapshot supplied through a pipe.
+cat snapshot.find | ls-lr-analyzer report --input-format find -
+```
+
+For saved `ls -lR` snapshots, `ls` is the default input format:
+
+```bash
+ls-lr-analyzer snapshot.txt
 ls-lr-analyzer before.txt after.txt
 ```
 
@@ -57,9 +81,36 @@ cargo install --path . --features sqlite,duckdb,parquet
 cargo install --path . --all-features
 ```
 
-## Daily use
+## Analyze and compare snapshots
 
-### Saved find snapshots
+### Read from stdin
+
+Use `-` as an input path to read stdin. Select the same input format as for a
+saved file; `ls` remains the default:
+
+```bash
+cat snapshot.txt | ls-lr-analyzer -
+cat snapshot.find | ls-lr-analyzer --input-format find -
+cat snapshot.tsv | ls-lr-analyzer report --input-format tsv -
+
+# Stream original metadata into an export.
+cat snapshot.find | ls-lr-analyzer export --input-format find - --output snapshot.tsv
+
+# One side of a comparison can be stdin.
+cat after.txt | ls-lr-analyzer before.txt -
+cat before.txt | ls-lr-analyzer - after.txt
+```
+
+stdin is processed with the same bounded-memory parsers and external sorting
+as file input. Reports label this input as `-`. Specify exactly one stdin input;
+`- -` is rejected. Omitting input paths remains an error. To read a file literally
+named `-`, use `./-`.
+
+stdin report input supports `ls`, `find`, and `tsv`. SQLite, DuckDB, and Parquet
+report input requires a file path. Export accepts `ls` or `find` from stdin and
+can produce any enabled output format, including SQLite and Parquet files.
+
+### Collect a snapshot with find
 
 ```bash
 # On the collection machine; save outside the selected directory.
@@ -76,38 +127,43 @@ ls-lr-analyzer export --input-format find snapshot.find --output snapshot.tsv
 ls-lr-analyzer report --input-format tsv before.tsv after.tsv
 ```
 
-The default remains saved `ls -lR` input. Find input also reads saved files only;
-the analyzer never launches find. The collection command excludes hidden entries
+Collection and analysis are separate steps: the analyzer reads metadata from
+files or stdin and never launches find. The collection command excludes hidden entries
 and does not follow links. `-xdev` belongs to collection, not analysis. See
 [find snapshot format and cautions](docs/find.md) for hidden-entry collection
 and validation details. No additional Cargo feature is needed for find input.
 
+### Explore snapshot reports
+
 ```bash
 # Inspect the capacity distribution of one snapshot.
-ls-lr-analyzer snapshot.txt
+ls-lr-analyzer report --input-format find snapshot.find
 
 # Compare snapshots with deeper grouping and shorter rankings.
-ls-lr-analyzer before.txt after.txt --depth 2 --top 5
+ls-lr-analyzer report --input-format find before.find after.find --depth 2 --top 5
 
 # Show average net growth over a known three-day interval.
-ls-lr-analyzer before.txt after.txt --days 3
+ls-lr-analyzer report --input-format find before.find after.find --days 3
 
 # Save the report or read it in a pager.
-ls-lr-analyzer before.txt after.txt > report.txt
-ls-lr-analyzer before.txt after.txt | less
+ls-lr-analyzer report --input-format find before.find after.find > report.txt
+ls-lr-analyzer report --input-format find before.find after.find | less
 
 # Show usage and options.
 ls-lr-analyzer --help
 
-# Save the listing metadata as a machine-readable intermediate artifact.
-ls-lr-analyzer export snapshot.txt > snapshot.tsv
+# Save snapshot metadata as a machine-readable intermediate artifact.
+ls-lr-analyzer export --input-format find snapshot.find > snapshot.tsv
 
 # Analyze or compare saved intermediate artifacts.
 ls-lr-analyzer report snapshot.tsv --input-format tsv
 ls-lr-analyzer report before.tsv after.tsv --input-format tsv --depth 2 --top 5
 ```
 
-Capture each listing with consistent units, locale, and filename quoting:
+### Collect a snapshot with ls
+
+The original `ls -lR` input remains supported. Collect each snapshot with
+consistent units, locale, and filename quoting:
 
 ```bash
 LC_ALL=C ls -lkR --quoting-style=literal /data > before.txt
@@ -126,7 +182,8 @@ ls-lr-analyzer export [OPTIONS] SNAPSHOT
 ls-lr-analyzer report [OPTIONS] [BEFORE] AFTER
 ```
 
-`export` saves metadata from one original listing; its default format is TSV.
+`export` normalizes one raw ls/find snapshot into a reusable artifact; its
+default format is TSV.
 `report` reads one snapshot for capacity or two for comparison, producing the
 same human-readable report for every input format. Its default input format is
 `ls`. Both comparison inputs use the selected format; extensions are not used to
@@ -145,8 +202,9 @@ including the earlier `--format tsv` export syntax.
 | `--output FILE` | Export destination; TSV defaults to stdout, other formats require a file. Must not already exist. |
 | `--sqlite3-bin PATH` | SQLite CLI executable; default: `sqlite3` found on `PATH`. |
 | `--duckdb-bin PATH` | DuckDB CLI executable for DuckDB and Parquet; default: `duckdb` found on `PATH`. |
-| `--source SOURCE` | `ls` (default), or `find` to read saved raw find snapshots. |
-| `--` | Treat all remaining arguments as input file paths. |
+| `--source SOURCE` | `ls` (default), or `find` to read raw find snapshots from a file or stdin. |
+| `-` | Read one input from stdin (`ls`, `find`, or `tsv`). |
+| `--` | Treat all remaining arguments as input paths; `-` still selects stdin. |
 | `-h`, `--help` | Print usage. |
 | `-V`, `--version` | Print the package version. |
 
@@ -309,14 +367,15 @@ The tool reports paths and measurements rather than guessing service categories.
 
 ## Compatibility and limitations
 
-- Supports the ordinary GNU `ls -lR` format, English and Korean date/total
+- ls input supports the ordinary GNU `ls -lR` format, English and Korean date/total
   markers, numeric owners/groups (`-n`), and literal filenames containing spaces.
   Tool-generated messages are in English; input paths and diagnostic examples
   retain their original text.
 - Root header names may differ, such as `/data` and `.`, and directory ordering
   may differ. Multiple independent roots in one input are not supported.
-- Human-readable sizes (`ls -lhR`), `--full-time`, and filenames containing
-  newlines are not supported. Keep date formats consistent between snapshots.
+- ls input does not support human-readable sizes (`ls -lhR`), `--full-time`, or
+  filenames containing newlines. Find input preserves exact epoch timestamps
+  and whitespace in names. Compare snapshots using the same format and scope.
 - Only regular files contribute to logical sizes. Symlinks are not followed.
   Directory block totals can include directories, links, and special files.
 - The listing does not establish the block unit; match `--block-size` to the
@@ -329,7 +388,7 @@ The tool reports paths and measurements rather than guessing service categories.
   `du`, and file counts are not exact inode counts.
 - Only `containers/storage/overlay/<ID>/merged` and its descendants are excluded
   by default. Including these unified views can double-count storage layers.
-- Analysis reads listing text, never the underlying file contents. Both capacity
+- Analysis reads snapshot metadata, never the underlying file contents. Both capacity
   and comparison reports use bounded sort buffers and stream records; neither
   keeps all files, directories, or path groups in memory. Renamed paths count
   as removal plus addition; snapshots cannot establish file identity.

@@ -31,13 +31,14 @@ ls-lr-analyzer report [OPTIONS] [BEFORE] AFTER
 
 export: normalize saved ls/find metadata. report: analyze one snapshot or compare two.
 Without a subcommand, the original listing report interface is retained.
+Use - for stdin (ls/find/tsv input); at most one comparison input may be stdin.
 
 --format FORMAT       Export: tsv (default), sqlite, parquet
 --input-format FORMAT ls (default), find, tsv, sqlite, duckdb, parquet
 --output FILE         Export destination; TSV defaults to stdout
 --sqlite3-bin PATH    SQLite CLI executable (default: sqlite3 on PATH)
 --duckdb-bin PATH     DuckDB CLI for DuckDB/Parquet (default: duckdb on PATH)
---source SOURCE       ls (default) or find; both read saved snapshot files
+--source SOURCE       ls (default) or find; read snapshot files or stdin
 --depth N             Report grouping depth (default: 1)
 --top N               Report ranking limit (default: 10)
 --days N              Report comparison interval; show average net growth
@@ -86,6 +87,7 @@ pub fn options() -> Result<Option<Options>> {
             continue;
         }
         match arg.as_str() {
+            "-" => o.inputs.push(arg.into()),
             "--" => positional = true,
             "--source" => o.source = args.next().ok_or("--source requires a value")?,
             "-h" | "--help" => {
@@ -168,6 +170,20 @@ fn validate(o: &Options) -> Result<()> {
     }
     if !(1..=2).contains(&o.inputs.len()) {
         return Err("Expected AFTER or BEFORE AFTER. See --help.".into());
+    }
+    let stdin_count = o
+        .inputs
+        .iter()
+        .filter(|p| crate::input::is_stdin(p))
+        .count();
+    if stdin_count > 1 {
+        return Err("Only one input may read stdin; - - is not supported".into());
+    }
+    if stdin_count != 0 && !matches!(o.input_format.as_str(), "ls" | "find" | "tsv") {
+        return Err(
+            "stdin supports ls, find, and tsv input; database/Parquet input requires a file path"
+                .into(),
+        );
     }
     if o.depth == 0 || o.top == 0 || o.block_size == 0 {
         return Err("depth, top, and block-size must be positive".into());

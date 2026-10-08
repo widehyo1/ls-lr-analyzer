@@ -1,6 +1,5 @@
-use std::fs::File;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{self, BufReader, Write};
+use std::io::{self, Write};
 mod cli;
 mod export;
 mod find;
@@ -119,7 +118,7 @@ fn run() -> Result<()> {
             if let Some(path) = &o.output {
                 export::export_tsv_file(&o.inputs[0], path)?;
             } else {
-                export::export_tsv(BufReader::new(File::open(&o.inputs[0])?), &mut out)?;
+                export::export_tsv(input::open(&o.inputs[0])?, &mut out)?;
             }
         } else {
             let a = report::analyze(&o)?;

@@ -1,6 +1,6 @@
 # Saved find snapshots
 
-The analyzer reads saved snapshots only. It never runs find or examines paths
+The analyzer reads snapshot files or stdin. It never runs find or examines paths
 on the analysis machine. GNU find is needed only on the collection machine;
 local analysis works without find, even with an empty PATH. No Cargo feature is
 required for find input.
@@ -27,6 +27,13 @@ across devices. To include hidden entries, remove the prune expression and use
 `find -P . -xdev -printf '...'` with the same format.
 
 ## Analyze elsewhere
+
+Use `-` to read a raw find snapshot from stdin, without buffering the whole input:
+
+```bash
+cat snapshot.find | ls-lr-analyzer report --input-format find -
+cat snapshot.find | ls-lr-analyzer export --input-format find - --output snapshot.tsv
+```
 
 ```bash
 ls-lr-analyzer report --input-format find snapshot.find

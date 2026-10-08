@@ -1,9 +1,9 @@
 [package]
 name = "ls-lr-analyzer"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.97"
-description = "Analyze ls -lR text snapshots and compare directory sizes, file counts, and growth."
+description = "Analyze and compare filesystem metadata snapshots from ls/find listings and exported artifacts."
 repository = "https://github.com/widehyo1/ls-lr-analyzer"
 readme = "README.md"
 license = "MIT"

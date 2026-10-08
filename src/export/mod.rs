@@ -1,6 +1,6 @@
 //! Shared snapshot rows, TSV serialization, and optional file backends.
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::Path;
 
 use crate::{Result, fields, header, permissions_record};
@@ -58,7 +58,7 @@ pub fn export_tsv_file(input: &Path, output: &Path) -> Result<()> {
     if output.try_exists()? {
         return Err(format!("Output already exists: {}", output.display()).into());
     }
-    let reader = BufReader::new(File::open(input)?);
+    let reader = crate::input::open(input)?;
     let parent = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

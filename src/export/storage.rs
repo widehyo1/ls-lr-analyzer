@@ -84,7 +84,7 @@ pub fn export(options: &Options) -> Result<()> {
         return Err(format!("Output already exists: {}", output.display()).into());
     }
     // Check input before launching tools or creating any temporary artifacts.
-    let input = BufReader::new(File::open(&options.inputs[0])?);
+    let input = crate::input::open(&options.inputs[0])?;
     let parent = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5
+
+- Accept `-` for streamed ls, find, and TSV report input with bounded memory.
+- Support stdin ls/find input for TSV and enabled SQLite/Parquet exports.
+- Allow stdin on either side of a comparison; reject two stdin inputs.
+- Document explicit stdin selection and file-only database/Parquet report input.
+- Test file/stdin equivalence, input validation, overwrite protection, and cleanup.
+
 ## 0.1.4
 
 - Replace full find path/metadata collections with bounded-memory external sorting.

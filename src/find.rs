@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 type Row = [String; 12];
 pub fn snapshot(path: &Path) -> Result<Staging> {
-    let input = BufReader::new(File::open(path)?);
+    let input = crate::input::open(path)?;
     let stage = Staging::new(&std::env::temp_dir())?;
     let mut writer = BufWriter::new(File::create(stage.0.join("snapshot.tsv"))?);
     normalize(input, &mut writer)?;
