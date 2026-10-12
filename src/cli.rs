@@ -30,7 +30,7 @@ const HELP: &str = "ls-lr-analyzer [OPTIONS] [BEFORE] AFTER
 ls-lr-analyzer export [OPTIONS] SNAPSHOT
 ls-lr-analyzer report [OPTIONS] [BEFORE] AFTER
 
-export: normalize saved ls/find metadata. report: analyze one snapshot or compare two.
+export: normalize ls/find metadata; convert Parquet to SQLite. report: analyze or compare.
 Without a subcommand, the original listing report interface is retained.
 Use - for stdin (ls/find/tsv input); at most one comparison input may be stdin.
 
@@ -200,11 +200,9 @@ fn check_feature(format: &str) -> Result<()> {
 fn validate(o: &Options) -> Result<()> {
     if o.duckdb_memory_limit.is_some()
         && o.format != "parquet"
-        && !(o.format == "text" && matches!(o.input_format.as_str(), "duckdb" | "parquet"))
+        && !matches!(o.input_format.as_str(), "duckdb" | "parquet")
     {
-        return Err(
-            "--duckdb-memory-limit requires Parquet export or DuckDB/Parquet report input".into(),
-        );
+        return Err("--duckdb-memory-limit requires Parquet export or DuckDB/Parquet input".into());
     }
     if !matches!(o.source.as_str(), "ls" | "find") {
         return Err("--source requires ls or find".into());
@@ -262,7 +260,10 @@ fn validate(o: &Options) -> Result<()> {
     if o.format == "text" && o.output.is_some() {
         return Err("Redirect stdout to save a report; --output is for export".into());
     }
-    if o.format != "text" && !matches!(o.input_format.as_str(), "ls" | "find") {
+    if o.format != "text"
+        && !matches!(o.input_format.as_str(), "ls" | "find")
+        && !(o.format == "sqlite" && o.input_format == "parquet")
+    {
         return Err("export requires an ls or find snapshot input".into());
     }
     check_feature(&o.format)?;

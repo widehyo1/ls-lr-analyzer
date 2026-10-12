@@ -300,7 +300,56 @@ fn duckdb_child_address_space_is_enforced_outside_the_buffer_manager() {
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("address-space guard enforced"));
     assert!(!output.exists());
+    let result = Command::new(env!("CARGO_BIN_EXE_ls-lr-analyzer"))
+        .args(["report", "--input-format", "parquet", "--duckdb-bin"])
+        .arg(&backend)
+        .arg(fixture())
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("address-space guard enforced"));
     assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
+}
+
+#[cfg(all(target_os = "linux", feature = "parquet"))]
+#[test]
+fn successful_client_status_with_incomplete_rows_is_rejected() {
+    use std::os::unix::fs::PermissionsExt;
+    if Command::new("python3").arg("--version").output().is_err() {
+        return;
+    }
+    let dir = TestDir::new();
+    let backend = dir.0.join("partial-client");
+    fs::write(
+        &backend,
+        r#"#!/usr/bin/env python3
+import sys,re,pathlib
+output=re.search(r" TO '([^']+)'",sys.argv[-1]).group(1)
+rows=[]
+for index,record in [(1,'directory'),(2,'total_bytes')]:
+    cells=[record,'.']+['']*10
+    if record=='total_bytes': cells[-1]='0'
+    rows.append(str(index)+'\t'+'\t'.join(c.encode().hex() for c in cells)+'\n')
+pathlib.Path(output).write_text(''.join(rows))
+print(3)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&backend, fs::Permissions::from_mode(0o755)).unwrap();
+    let temporary = dir.0.join("tmp");
+    fs::create_dir(&temporary).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_ls-lr-analyzer"))
+        .env("TMPDIR", &temporary)
+        .args(["report", "--input-format", "parquet", "--duckdb-bin"])
+        .arg(&backend)
+        .arg(fixture())
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("expected 3 rows, received 2"));
+    assert_eq!(fs::read_dir(temporary).unwrap().count(), 0);
 }
 
 #[test]
@@ -383,6 +432,169 @@ fn report_body(bytes: &[u8]) -> String {
         .filter(|line| !line.starts_with("  before:") && !line.starts_with("  after:"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(all(feature = "sqlite", feature = "parquet"))]
+#[test]
+fn shuffled_parquet_to_sqlite_preserves_cells_reports_and_atomicity() {
+    if Command::new("duckdb").arg("--version").output().is_err()
+        || Command::new("sqlite3").arg("--version").output().is_err()
+    {
+        return;
+    }
+    let dir = TestDir::new();
+    let parquet = dir.0.join("shuffled.parquet");
+    let made = Command::new("duckdb").args(["-batch", "-bail", ":memory:"])
+        .arg(format!("COPY (SELECT row_index - 3 AS row_index, * EXCLUDE (row_index) FROM read_parquet('{}') ORDER BY row_index DESC) TO '{}' (FORMAT PARQUET);",
+            named_fixture("after.parquet").display(), parquet.display()))
+        .output().unwrap();
+    assert!(made.status.success());
+    let sqlite = dir.0.join("snapshot.sqlite");
+    let too_small = Command::new(env!("CARGO_BIN_EXE_ls-lr-analyzer"))
+        .args([
+            "export",
+            "--input-format",
+            "parquet",
+            "--format",
+            "sqlite",
+            "--duckdb-memory-limit",
+            "1B",
+            "--output",
+        ])
+        .arg(&sqlite)
+        .arg(&parquet)
+        .output()
+        .unwrap();
+    assert!(!too_small.status.success());
+    assert!(!sqlite.exists());
+    let export = || {
+        Command::new(env!("CARGO_BIN_EXE_ls-lr-analyzer"))
+            .args([
+                "export",
+                "--input-format",
+                "parquet",
+                "--format",
+                "sqlite",
+                "--duckdb-memory-limit",
+                "64MiB",
+                "--output",
+            ])
+            .arg(&sqlite)
+            .arg(&parquet)
+            .output()
+            .unwrap()
+    };
+    let result = export();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let expected = Command::new(env!("CARGO_BIN_EXE_ls-lr-analyzer"))
+        .arg(named_fixture("after.txt"))
+        .output()
+        .unwrap();
+    for (format, input) in [("parquet", &parquet), ("sqlite", &sqlite)] {
+        let report = Command::new(env!("CARGO_BIN_EXE_ls-lr-analyzer"))
+            .args(["report", "--input-format", format])
+            .arg(input)
+            .output()
+            .unwrap();
+        assert!(
+            report.status.success(),
+            "{}",
+            String::from_utf8_lossy(&report.stderr)
+        );
+        assert_eq!(report_body(&report.stdout), report_body(&expected.stdout));
+    }
+    let columns = [
+        "record",
+        "directory",
+        "permissions",
+        "links",
+        "owner",
+        "group",
+        "size_or_device",
+        "month",
+        "day",
+        "time_or_year",
+        "name",
+        "total",
+    ]
+    .map(|c| format!("hex(\"{c}\")"))
+    .join(" || ':' || ");
+    let original = Command::new("duckdb")
+        .args(["-list", "-noheader", ":memory:"])
+        .arg(format!(
+            "SELECT {columns} FROM read_parquet('{}') ORDER BY row_index;",
+            parquet.display()
+        ))
+        .output()
+        .unwrap();
+    let converted = Command::new("sqlite3")
+        .args(["-list", "-noheader"])
+        .arg(&sqlite)
+        .arg(format!(
+            "SELECT {columns} FROM snapshot ORDER BY row_index;"
+        ))
+        .output()
+        .unwrap();
+    assert!(original.status.success() && converted.status.success());
+    assert_eq!(original.stdout, converted.stdout);
+    let bytes = fs::read(&sqlite).unwrap();
+    assert!(!export().status.success());
+    assert_eq!(fs::read(&sqlite).unwrap(), bytes);
+    assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 2);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_read_rejects_rows_beyond_engine_budget_and_cleans_staging() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        return;
+    }
+    let dir = TestDir::new();
+    let database = dir.0.join("huge.sqlite");
+    let schema = fs::read_to_string(named_fixture("after.tsv")).unwrap();
+    let columns = schema
+        .lines()
+        .next()
+        .unwrap()
+        .split('\t')
+        .map(|c| format!("\"{c}\" TEXT"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let made = Command::new("sqlite3").arg(&database)
+        .arg(format!("CREATE TABLE snapshot (row_index BIGINT, {columns}); INSERT INTO snapshot (row_index, record) VALUES (1, zeroblob(80*1024*1024));"))
+        .output().unwrap();
+    assert!(made.status.success());
+    let temporary = dir.0.join("tmp");
+    fs::create_dir(&temporary).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ls-lr-analyzer"))
+        .env("TMPDIR", &temporary)
+        .args(["report", "--input-format", "sqlite"])
+        .arg(&database)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("out of memory"));
+    assert!(out.stdout.is_empty());
+    assert_eq!(fs::read_dir(&temporary).unwrap().count(), 0);
+    let updated = Command::new("sqlite3")
+        .arg(&database)
+        .arg("UPDATE snapshot SET record=NULL;")
+        .output()
+        .unwrap();
+    assert!(updated.status.success());
+    let out = Command::new(env!("CARGO_BIN_EXE_ls-lr-analyzer"))
+        .env("TMPDIR", &temporary)
+        .args(["report", "--input-format", "sqlite"])
+        .arg(&database)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Invalid hexadecimal snapshot cell"));
+    assert_eq!(fs::read_dir(temporary).unwrap().count(), 0);
 }
 
 #[test]
@@ -782,7 +994,7 @@ fn client_errors_are_reported_and_partial_exports_are_removed() {
     fs::create_dir(&binaries).unwrap();
     for binary in ["sqlite3", "duckdb"] {
         let path = binaries.join(binary);
-        fs::write(&path, "#!/bin/sh\ncase \"$*\" in\n*'SELECT 42;'*) printf '42\\n' ;;\n*) printf 'intentional backend failure\\n' >&2; exit 1 ;;\nesac\n").unwrap();
+        fs::write(&path, "#!/bin/sh\ncase \"$*\" in\n*'PRAGMA hard_heap_limit; SELECT 42;'*) printf '67108864\\n42\\n' ;;\n*'SELECT 42;'*) printf '42\\n' ;;\n*) printf 'intentional backend failure\\n' >&2; exit 1 ;;\nesac\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
     for (format, _, enabled) in formats() {

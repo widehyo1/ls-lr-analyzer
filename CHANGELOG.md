@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.7
+
+- Stream database/Parquet reads to disk and restore row-index order with bounded external sorting, removing whole-snapshot SQL sorting and CLI result materialization.
+- Check delivered row counts against source counts; reject incomplete client output even when the client exits successfully.
+- Support Parquet-to-SQLite export; bound SQLite read/export heap, page cache, and child address space, and index new snapshots by row number.
+- Allow `--duckdb-memory-limit SIZE` for Parquet-to-SQLite export input; retain the default 64 MiB DuckDB budget and engine-default CSV memory settings.
+- Test shuffled and signed row indices, incomplete successful client output, SQLite heap exhaustion, read-path address-space limits, and failure cleanup.
+- Verify full Parquet report, Parquet-to-SQLite export, and SQLite report with 11,272,039 actual rows; confirm metadata hashes and report results match.
+
 ## 0.1.6
 
 - Reject oversized stdin/file fields and lines before unbounded allocation; bound temporary sort records and report ranking counts.

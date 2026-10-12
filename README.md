@@ -61,7 +61,7 @@ cargo install ls-lr-analyzer --all-features
 | `duckdb` | Existing DuckDB database report input only | `duckdb` |
 | `parquet` | Parquet file | `duckdb` |
 
-Features are independent and add no crate dependencies. Enabling `parquet` does
+Features are independent and use the optional `libc` crate for Linux resource limits. Enabling `parquet` does
 not require enabling `duckdb`. Installation does not require the external
 executables; they are checked when reading or exporting that format. Each
 `sqlite` and `parquet` enable export and report input; `duckdb` enables report
@@ -69,7 +69,7 @@ input only for existing database snapshots.
 
 ## Build from source
 
-Building requires Rust 1.97 or newer. To build and install from a checkout:
+Building requires Rust 1.99 or newer. To build and install from a checkout:
 
 ```bash
 git clone https://github.com/widehyo1/ls-lr-analyzer.git
@@ -199,7 +199,7 @@ including the earlier `--format tsv` export syntax.
 | `--block-size N` | Report: bytes per directory `ls total` unit. Default: 1024. |
 | `--include-merged` | Report: include container overlay merged views, excluded by default. |
 | `--format FORMAT` | Export: `tsv` (default), `sqlite`, or `parquet`. |
-| `--input-format FORMAT` | `ls` (default), `find`, `tsv`, `sqlite`, `duckdb`, or `parquet`; export accepts `ls`/`find`. |
+| `--input-format FORMAT` | `ls` (default), `find`, `tsv`, `sqlite`, `duckdb`, or `parquet`; export accepts `ls`/`find`, plus `parquet` for SQLite output. |
 | `--output FILE` | Export destination; TSV defaults to stdout, other formats require a file. Must not already exist. |
 | `--sqlite3-bin PATH` | SQLite CLI executable; default: `sqlite3` found on `PATH`. |
 | `--duckdb-bin PATH` | DuckDB CLI executable for DuckDB and Parquet; default: `duckdb` found on `PATH`. |
@@ -254,11 +254,15 @@ these rows without external tools.
 
 ## Database and Parquet exports
 
+Version 0.1.7 adds bounded database/Parquet reads and Parquet-to-SQLite export,
+including source row-count verification and fixed SQLite memory budgets.
+
 With the corresponding features enabled:
 
 ```bash
 ls-lr-analyzer export snapshot.txt --format sqlite --output snapshot.sqlite
 ls-lr-analyzer export snapshot.txt --format parquet --output snapshot.parquet
+ls-lr-analyzer export snapshot.parquet --input-format parquet --format sqlite --output snapshot.sqlite
 
 ls-lr-analyzer report snapshot.sqlite --input-format sqlite
 ls-lr-analyzer report before.duckdb after.duckdb --input-format duckdb
@@ -342,16 +346,33 @@ up after success or ordinary errors.
 TSV file output uses the same staging and publication rules. Redirecting TSV
 stdout uses the shell's normal redirection behavior.
 
-No new third-party crates are used for these formats.
-
 Reports open database inputs read-only. Database and Parquet rows are transferred
-through a temporary file in the system temporary directory; metadata is then
-externally sorted and processed record by record. The same analysis and report renderer are used
+through a temporary hex file in the system temporary directory. DuckDB uses a
+streaming `COPY` sink, with insertion-order preservation disabled, rather than
+a CLI `SELECT` result or a whole-snapshot SQL `ORDER BY`. Rust restores signed
+`row_index` order with an 8 MiB external-sort buffer and at most 16 merge readers.
+Decoded transport rows, including length prefixes, must fit the 1 MiB sort-cell
+limit. Invalid or duplicate row indices and NULL metadata cells are rejected.
+The source row count is checked against delivered rows: a client exiting
+successfully with incomplete output is still rejected. SQLite reads count and
+rows in the same read transaction.
+Metadata is then externally grouped and processed record by record.
+The same analysis and report renderer are used
 for original listings and all intermediate formats. Export preserves block
 totals in their original units, so supply the same `--block-size` when reporting
 ls source or exported data; find's `total_bytes` records need no unit option.
 CLI file reports contain the supplied artifact
 paths in their input labels.
+
+Parquet-to-SQLite export uses this same bounded reader. It preserves the 12
+metadata cells and source row order, assigning fresh 1-based indices. New SQLite
+snapshots use `row_index INTEGER PRIMARY KEY`; older unindexed snapshots remain
+readable. SQLite reading and export use a 64 MiB hard heap limit, a 128-page cache,
+disk temporary storage, cache spill, and no memory mapping. The cache remains
+at most 8 MiB even with SQLite's maximum 64 KiB page size. Every SQLite child
+also receives the Linux 1.25 GiB address-space ceiling, including capability
+checks; unsupported platforms fail explicitly. A row larger than the fixed
+budgets fails cleanly. No SQLite memory CLI option is added.
 
 ### Test fixtures
 

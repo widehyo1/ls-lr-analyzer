@@ -9,10 +9,18 @@ use super::temp::Staging;
 use super::{EXPORT_COLUMNS, export_rows};
 use crate::{Options, Result};
 
-fn client(binary: &Path, init: &Path) -> Command {
-    let mut command = Command::new(binary);
-    command.args(["-batch", "-bail", "-init"]).arg(init);
-    command
+const SQLITE_MEMORY: u64 = 64 * 1024 * 1024;
+
+fn sqlite_init(init: &Path) -> Result<()> {
+    // Bound both SQLite-managed allocations and the CLI statement/row buffers.
+    // Positive page counts avoid cache budgets depending on a supplied page size.
+    fs::write(
+        init,
+        format!(
+            ".output /dev/null\nPRAGMA hard_heap_limit={SQLITE_MEMORY};\nPRAGMA cache_size=128;\nPRAGMA temp_store=FILE;\nPRAGMA mmap_size=0;\nPRAGMA cache_spill=ON;\n.output stdout\n"
+        ),
+    )?;
+    Ok(())
 }
 
 // Client output can be arbitrarily large on failures. Spool it to disk and
@@ -34,13 +42,13 @@ fn execute(mut command: Command, directory: &Path) -> Result<(ExitStatus, String
 }
 
 fn check_client(binary: &Path, init: &Path, query: &str) -> Result<()> {
-    let mut command = client(binary, init);
+    let mut command = super::guard::client(binary, init, SQLITE_MEMORY)?;
     command
         .args(["-csv", "-noheader", ":memory:", query])
         .stdin(Stdio::null());
     let (status, stdout, stderr) = execute(command, init.parent().unwrap())
         .map_err(|e| format!("Cannot execute {}: {e}", binary.display()))?;
-    if !status.success() || stdout != "42" {
+    if !status.success() || stdout != format!("{SQLITE_MEMORY}\n42") {
         return Err(format!(
             "{} capability check failed: {status} {stderr}",
             binary.display()
@@ -83,8 +91,14 @@ pub fn export(options: &Options) -> Result<()> {
     if output.try_exists()? {
         return Err(format!("Output already exists: {}", output.display()).into());
     }
-    // Check input before launching tools or creating any temporary artifacts.
-    let input = crate::input::open(&options.inputs[0])?;
+    // Check the source before starting destination export. Database input uses
+    // the same bounded transport and ordering contract as reports.
+    let database_input = options.input_format == "parquet";
+    let input = if database_input {
+        read_rows(&options.inputs[0], options)?
+    } else {
+        crate::input::open(&options.inputs[0])?
+    };
     let parent = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -117,21 +131,25 @@ pub fn export(options: &Options) -> Result<()> {
         }
         return export_parquet(input, output, &stage, &init, options);
     }
-    check_client(binary, &init, "SELECT 42;")?;
+    sqlite_init(&init)?;
+    check_client(binary, &init, "PRAGMA hard_heap_limit; SELECT 42;")?;
 
     let sql = stage.0.join("export.sql");
     let mut script = BufWriter::new(File::create(&sql)?);
     write!(
         script,
-        "BEGIN TRANSACTION;\nCREATE TABLE snapshot (row_index BIGINT"
+        "BEGIN TRANSACTION;\nCREATE TABLE snapshot (row_index INTEGER PRIMARY KEY"
     )?;
     for column in EXPORT_COLUMNS {
         write!(script, ", \"{column}\" TEXT")?;
     }
     writeln!(script, ");")?;
     let mut row_index = 0_u64;
-    export_rows(input, |row| {
-        row_index += 1;
+    source_rows(input, database_input, |row| {
+        row_index = row_index
+            .checked_add(1)
+            .filter(|&n| n <= i64::MAX as u64)
+            .ok_or("Export row count overflow")?;
         write!(script, "INSERT INTO snapshot VALUES ({row_index}")?;
         for cell in row {
             write!(script, ", ")?;
@@ -144,7 +162,7 @@ pub fn export(options: &Options) -> Result<()> {
     let database = stage.0.join("snapshot.db");
     script.flush()?;
     drop(script);
-    let mut command = client(binary, &init);
+    let mut command = super::guard::client(binary, &init, SQLITE_MEMORY)?;
     command.arg(&database).stdin(File::open(&sql)?);
     let (status, _, stderr) = execute(command, &stage.0)?;
     if !status.success() {
@@ -153,6 +171,28 @@ pub fn export(options: &Options) -> Result<()> {
     // Both paths are on the same filesystem. Linking publishes the finished
     // artifact atomically and refuses to overwrite a concurrently created file.
     fs::hard_link(&database, output)?;
+    Ok(())
+}
+
+fn source_rows(
+    mut input: impl BufRead,
+    hex: bool,
+    mut emit: impl FnMut(&[&str; 12]) -> Result<()>,
+) -> Result<()> {
+    if !hex {
+        return export_rows(input, emit);
+    }
+    while let Some(line) = crate::limits::line_with_limit(&mut input, crate::limits::HEX_LINE)? {
+        if line.split('\t').count() != 12 {
+            return Err("Invalid hexadecimal snapshot row: expected 12 columns".into());
+        }
+        let cells = line
+            .split('\t')
+            .map(|v| crate::input::decode(v, true))
+            .collect::<Result<Vec<_>>>()?;
+        let row: Vec<_> = cells.iter().map(String::as_str).collect();
+        emit(&row.try_into().map_err(|_| "Invalid snapshot row")?)?;
+    }
     Ok(())
 }
 
@@ -323,37 +363,60 @@ pub fn read_rows(path: &Path, options: &Options) -> Result<Box<dyn BufRead>> {
     } else {
         "snapshot".into()
     };
-    // A hex-encoded transport keeps CLI quoting and delimiters out of cell data.
+    // COPY is a streaming sink. A CLI SELECT can retain the complete result,
+    // even without ORDER BY, outside DuckDB's buffer-manager budget.
     let columns = EXPORT_COLUMNS
         .iter()
-        .map(|column| format!("hex(\"{column}\")"))
-        .collect::<Vec<_>>()
-        .join(" || '\t' || ");
-    let query = format!(
-        "{}SELECT {columns} FROM {table} ORDER BY row_index;",
-        if sqlite {
-            String::new()
-        } else {
-            duckdb_settings(&stage.0, options.duckdb_memory_limit_bytes())?
-        }
-    );
+        .map(|column| {
+            if sqlite {
+                // SQLite hex(NULL) is '', so coalesce(hex(...)) cannot detect it.
+                format!("CASE WHEN \"{column}\" IS NULL THEN '!' ELSE hex(\"{column}\") END")
+            } else {
+                format!("coalesce(hex(\"{column}\"), '!')")
+            }
+        })
+        .collect::<Vec<_>>();
     let rows = stage.0.join("rows.hex");
     let errors = stage.0.join("stderr.txt");
-    let mut command = if sqlite {
-        client(binary, &init)
+    let query = if sqlite {
+        sqlite_init(&init)?;
+        check_client(binary, &init, "PRAGMA hard_heap_limit; SELECT 42;")?;
+        format!(
+            "BEGIN; SELECT count(*) FROM {table}; SELECT row_index || '\t' || {} FROM {table}; COMMIT;",
+            columns.join(" || '\t' || ")
+        )
     } else {
-        super::guard::client(binary, &init, options.duckdb_memory_limit_bytes())?
+        format!(
+            "{}SET preserve_insertion_order=false; SELECT count(*) FROM {table}; COPY (SELECT row_index, {} FROM {table}) TO {} (FORMAT CSV, HEADER false, DELIMITER '\t', QUOTE '', ESCAPE '');",
+            duckdb_settings(&stage.0, options.duckdb_memory_limit_bytes())?,
+            columns.join(", "),
+            sql_path(&rows)?
+        )
     };
+    let mut command = super::guard::client(
+        binary,
+        &init,
+        if sqlite {
+            SQLITE_MEMORY
+        } else {
+            options.duckdb_memory_limit_bytes()
+        },
+    )?;
     command.args(["-list", "-noheader"]);
     if options.input_format == "parquet" {
         command.arg(":memory:");
     } else {
         command.arg("-readonly").arg(&path);
     }
+    let stdout = if sqlite {
+        rows.clone()
+    } else {
+        stage.0.join("stdout.txt")
+    };
     let status = command
         .arg(query)
         .stdin(Stdio::null())
-        .stdout(File::create(&rows)?)
+        .stdout(File::create(&stdout)?)
         .stderr(File::create(&errors)?)
         .status()
         .map_err(|e| format!("Cannot execute {}: {e}", binary.display()))?;
@@ -365,8 +428,84 @@ pub fn read_rows(path: &Path, options: &Options) -> Result<Box<dyn BufRead>> {
         )
         .into());
     }
+    let ordered = stage.0.join("ordered.hex");
+    let mut reader = BufReader::new(File::open(&rows)?);
+    let expected = if sqlite {
+        crate::limits::line(&mut reader)?
+    } else {
+        crate::limits::line(&mut BufReader::new(File::open(&stdout)?))?
+    }
+    .ok_or("Missing database row count")?
+    .parse::<u64>()?;
+    order_rows(reader, &ordered, expected)?;
+    fs::remove_file(rows)?;
     Ok(Box::new(RowFile {
-        reader: BufReader::new(File::open(rows)?),
+        reader: BufReader::new(File::open(ordered)?),
         _stage: stage,
     }))
+}
+
+// Retain compact decoded cells in the bounded external sorter. This preserves
+// logical row_index order even for physically shuffled files, without requiring
+// either database engine to sort the entire wide snapshot.
+fn order_rows(mut reader: impl BufRead, output: &Path, expected: u64) -> Result<()> {
+    let mut sorter = crate::sort::Sorter::new()?;
+    let mut received = 0_u64;
+    while let Some(line) = crate::limits::line_with_limit(&mut reader, crate::limits::HEX_LINE)? {
+        if line.split('\t').count() != 13 {
+            return Err("Invalid database snapshot row: expected row_index and 12 cells".into());
+        }
+        let mut cells = line.split('\t');
+        let index: i64 = cells.next().unwrap().parse()?;
+        // Sign-bit bias makes a fixed-width lexical key match signed SQL order.
+        let key = format!("{:020}", (index as u64) ^ (1_u64 << 63));
+        let capacity = 48 + cells.clone().map(|cell| cell.len() / 2).sum::<usize>();
+        if capacity > crate::limits::SORT_CELL {
+            return Err("Decoded database row exceeds sort memory limit".into());
+        }
+        let mut data = Vec::with_capacity(capacity);
+        for cell in cells {
+            let value = crate::input::decode(cell, true)?;
+            data.extend_from_slice(&(u32::try_from(value.len())?).to_le_bytes());
+            data.extend_from_slice(value.as_bytes());
+        }
+        sorter.push(crate::sort::Record {
+            key: (key, String::new()),
+            data,
+        })?;
+        received = received
+            .checked_add(1)
+            .ok_or("Database row count overflow")?;
+    }
+    drop(reader);
+    if received != expected {
+        return Err(format!(
+            "Incomplete database read: expected {expected} rows, received {received}"
+        )
+        .into());
+    }
+    let mut sorted = sorter.finish()?;
+    let mut writer = BufWriter::new(File::create(output)?);
+    let mut previous = None;
+    while let Some(record) = sorted.next()? {
+        if previous.as_ref() == Some(&record.key.0) {
+            return Err("Duplicate snapshot row_index".into());
+        }
+        previous = Some(record.key.0);
+        let mut data = record.data.as_slice();
+        for i in 0..12 {
+            if i != 0 {
+                writer.write_all(b"\t")?;
+            }
+            let length = u32::from_le_bytes(data[..4].try_into()?) as usize;
+            data = &data[4..];
+            for byte in &data[..length] {
+                write!(writer, "{byte:02x}")?;
+            }
+            data = &data[length..];
+        }
+        writeln!(writer)?;
+    }
+    writer.flush()?;
+    Ok(())
 }
