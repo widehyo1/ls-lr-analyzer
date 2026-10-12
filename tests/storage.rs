@@ -43,16 +43,22 @@ fn parquet_uses_memory_bulk_import_and_preserves_empty_and_special_cells() {
     let dir = TestDir::new();
     let wrapper = dir.0.join("duckdb-wrapper");
     let log = dir.0.join("arguments");
+    let limits = dir.0.join("limits");
     fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nexec '{}' \"$@\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nulimit -v >> '{}'\nexec '{}' \"$@\"\n",
             log.display(),
+            limits.display(),
             binary.display()
         ),
     )
     .unwrap();
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let long = format!(
+        ".:\ntotal 0\n-rw-r--r-- 1 u g 1 Oct 3 12:00 {}\n",
+        "a".repeat(200 * 1024)
+    );
     for (name, data, rows) in [
         ("empty", "", "0"),
         (
@@ -60,18 +66,22 @@ fn parquet_uses_memory_bulk_import_and_preserves_empty_and_special_cells() {
             "./data:\ntotal 0\n-rw-r--r-- 1 NULL g 0 Oct 3 12:00 한글\tfile\\name\0x\n",
             "3",
         ),
+        ("long", long.as_str(), "3"),
     ] {
         let input = dir.0.join(name);
         fs::write(&input, data).unwrap();
         let output = dir.0.join(format!("{name}.parquet"));
-        let exported = Command::new(env!("CARGO_BIN_EXE_ls-lr-analyzer"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ls-lr-analyzer"));
+        command
             .args(["export", "--format", "parquet", "--duckdb-bin"])
             .arg(&wrapper)
             .arg(&input)
             .arg("--output")
-            .arg(&output)
-            .output()
-            .unwrap();
+            .arg(&output);
+        if name == "special" {
+            command.args(["--duckdb-memory-limit", "128MiB"]);
+        }
+        let exported = command.output().unwrap();
         assert!(
             exported.status.success(),
             "{}",
@@ -89,7 +99,15 @@ fn parquet_uses_memory_bulk_import_and_preserves_empty_and_special_cells() {
         assert_eq!(String::from_utf8_lossy(&counted.stdout).trim(), rows);
         if rows != "0" {
             let report = Command::new(env!("CARGO_BIN_EXE_ls-lr-analyzer"))
-                .args(["report", "--input-format", "parquet"])
+                .args([
+                    "report",
+                    "--input-format",
+                    "parquet",
+                    "--duckdb-memory-limit",
+                    "256MiB",
+                    "--duckdb-bin",
+                ])
+                .arg(&wrapper)
                 .arg(&output)
                 .output()
                 .unwrap();
@@ -102,6 +120,187 @@ fn parquet_uses_memory_bulk_import_and_preserves_empty_and_special_cells() {
     assert!(commands.contains("read_csv("));
     assert!(!commands.contains("INSERT"));
     assert!(!commands.contains("snapshot.db"));
+    assert!(!commands.contains("buffer_size="));
+    assert!(commands.contains("memory_limit='67108864B'"));
+    assert!(commands.contains("memory_limit='134217728B'"));
+    assert!(commands.contains("memory_limit='268435456B'"));
+    let limits = fs::read_to_string(limits).unwrap();
+    assert!(limits.lines().all(|line| {
+        line.parse::<u64>()
+            .is_ok_and(|n| n > 0 && n <= 2 * 1024 * 1024)
+    }));
+}
+
+#[cfg(all(unix, feature = "parquet"))]
+#[test]
+fn stdin_parquet_batches_preserve_all_cells_and_row_order() {
+    use std::io::Write;
+    use std::process::Stdio;
+    if Command::new("duckdb").arg("--version").output().is_err() {
+        return;
+    }
+    let dir = TestDir::new();
+    let output = dir.0.join("many.parquet");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ls-lr-analyzer"))
+        .args([
+            "export",
+            "--format",
+            "parquet",
+            "--duckdb-memory-limit",
+            "64MiB",
+            "--output",
+        ])
+        .arg(&output)
+        .arg("-")
+        .env("TMPDIR", &dir.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "./data:\ntotal 0").unwrap();
+    for i in 0..20000 {
+        writeln!(
+            stdin,
+            "-rw-r--r-- 1 NULL g {i} Oct 3 12:00 한글\tfile\\name-{i}"
+        )
+        .unwrap();
+    }
+    drop(stdin);
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(result.stdout.is_empty());
+    let query = format!(
+        "SELECT count(*), sum(row_index), count(CASE WHEN record='entry' AND owner='NULL' AND size_or_device=CAST(row_index-3 AS VARCHAR) AND name='한글' || chr(9) || 'file\\name-' || CAST(row_index-3 AS VARCHAR) THEN 1 END) FROM read_parquet('{}'); SELECT count(DISTINCT row_group_id) FROM parquet_metadata('{}');",
+        output.display(),
+        output.display()
+    );
+    let counted = Command::new("duckdb")
+        .args([
+            "-batch",
+            "-bail",
+            "-init",
+            "/dev/null",
+            "-csv",
+            "-noheader",
+            ":memory:",
+        ])
+        .arg(query)
+        .output()
+        .unwrap();
+    assert!(
+        counted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&counted.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&counted.stdout).trim(),
+        "20002,200050003,20000\n3"
+    );
+    let ordered = Command::new("duckdb").args(["-batch", "-bail", "-init", "/dev/null", "-csv", "-noheader", ":memory:"]).arg(format!("SELECT count(*) FROM (SELECT row_index, row_number() OVER () AS physical FROM read_parquet('{}')) WHERE row_index<>physical;", output.display())).output().unwrap();
+    assert!(ordered.status.success());
+    assert_eq!(String::from_utf8_lossy(&ordered.stdout).trim(), "0");
+    assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
+}
+
+#[cfg(all(unix, feature = "parquet"))]
+#[test]
+fn insufficient_duckdb_budget_does_not_publish_partial_output() {
+    if Command::new("duckdb").arg("--version").output().is_err() {
+        return;
+    }
+    let dir = TestDir::new();
+    let output = dir.0.join("failed.parquet");
+    let result = Command::new(env!("CARGO_BIN_EXE_ls-lr-analyzer"))
+        .args([
+            "export",
+            "--format",
+            "parquet",
+            "--duckdb-memory-limit",
+            "1B",
+            "--output",
+        ])
+        .arg(&output)
+        .arg(fixture())
+        .env("TMPDIR", &dir.0)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(!output.exists());
+    assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
+}
+
+#[cfg(all(target_os = "linux", feature = "parquet"))]
+#[test]
+fn malformed_stdin_after_a_completed_batch_removes_all_staging() {
+    use std::io::Write;
+    use std::process::Stdio;
+    if Command::new("duckdb").arg("--version").output().is_err() {
+        return;
+    }
+    let dir = TestDir::new();
+    let output = dir.0.join("failed.parquet");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ls-lr-analyzer"))
+        .args(["export", "--format", "parquet", "--output"])
+        .arg(&output)
+        .arg("-")
+        .env("TMPDIR", &dir.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, ".:\ntotal 0").unwrap();
+    for i in 0..10000 {
+        writeln!(stdin, "-rw-r--r-- 1 u g 1 Oct 3 12:00 f{i}").unwrap();
+    }
+    let _ = stdin.write_all(b"\xff\n");
+    drop(stdin);
+    let result = child.wait_with_output().unwrap();
+    assert!(!result.status.success());
+    assert!(!output.exists());
+    assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
+}
+
+#[cfg(all(target_os = "linux", feature = "parquet"))]
+#[test]
+fn duckdb_child_address_space_is_enforced_outside_the_buffer_manager() {
+    use std::os::unix::fs::PermissionsExt;
+    if Command::new("python3").arg("--version").output().is_err() {
+        return;
+    }
+    let dir = TestDir::new();
+    let backend = dir.0.join("allocate-address-space");
+    // mmap reserves virtual space without touching 2 GiB of physical RAM.
+    // This exercises the OS guard, independent of DuckDB's managed allocator.
+    fs::write(&backend, "#!/usr/bin/env python3\nimport mmap,sys\ntry:\n    allocation=mmap.mmap(-1, 2*1024*1024*1024)\nexcept (OSError,MemoryError):\n    print('address-space guard enforced',file=sys.stderr)\n    sys.exit(1)\nprint(42)\n").unwrap();
+    fs::set_permissions(&backend, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = dir.0.join("failed.parquet");
+    let result = Command::new(env!("CARGO_BIN_EXE_ls-lr-analyzer"))
+        .args([
+            "export",
+            "--format",
+            "parquet",
+            "--duckdb-memory-limit",
+            "64MiB",
+            "--duckdb-bin",
+        ])
+        .arg(&backend)
+        .arg("--output")
+        .arg(&output)
+        .arg(fixture())
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("address-space guard enforced"));
+    assert!(!output.exists());
+    assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
 }
 
 #[test]

@@ -8,6 +8,10 @@ use crate::{Result, fields, header, permissions_record};
 pub mod temp;
 
 #[cfg(any(feature = "sqlite", feature = "duckdb", feature = "parquet"))]
+mod guard;
+#[cfg(any(feature = "sqlite", feature = "duckdb", feature = "parquet"))]
+mod parquet;
+#[cfg(any(feature = "sqlite", feature = "duckdb", feature = "parquet"))]
 mod storage;
 #[cfg(any(feature = "sqlite", feature = "duckdb", feature = "parquet"))]
 pub use storage::export as export_file;
@@ -16,6 +20,21 @@ pub use storage::read_rows;
 
 // TSV cells use reversible escapes, keeping every record on one physical line.
 pub fn tsv_row(w: &mut impl Write, cells: &[&str; 12]) -> Result<()> {
+    let length = 11
+        + cells
+            .iter()
+            .flat_map(|cell| cell.bytes())
+            .map(|byte| {
+                if matches!(byte, b'\\' | b'\t' | b'\n' | b'\r') {
+                    2
+                } else {
+                    1
+                }
+            })
+            .sum::<usize>();
+    if length > crate::limits::TEXT_LINE {
+        return Err("Normalized TSV row exceeds 262144-byte limit".into());
+    }
     for (i, cell) in cells.iter().enumerate() {
         if i != 0 {
             write!(w, "\t")?;
@@ -89,13 +108,14 @@ pub(crate) fn rows(
         .fill_buf()?
         .starts_with(b"record\tdirectory\tpermissions\t")
     {
-        let mut header = String::new();
-        reader.read_line(&mut header)?;
+        let header = crate::limits::line(&mut reader)?.ok_or("Missing snapshot TSV header")?;
         if header.trim_end() != EXPORT_COLUMNS.join("\t") {
             return Err("Invalid snapshot TSV header".into());
         }
-        for line in reader.lines() {
-            let line = line?;
+        while let Some(line) = crate::limits::line(&mut reader)? {
+            if line.split('\t').count() != 12 {
+                return Err("Invalid snapshot TSV row: expected 12 columns".into());
+            }
             let cells = line
                 .split('\t')
                 .map(|v| crate::input::decode(v, false))
@@ -107,8 +127,7 @@ pub(crate) fn rows(
     }
     let mut directory = String::new();
     let mut warnings = 0;
-    for line in reader.lines() {
-        let line = line?;
+    while let Some(line) = crate::limits::line(&mut reader)? {
         if line.is_empty() {
             continue;
         }

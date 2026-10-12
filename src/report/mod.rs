@@ -766,6 +766,7 @@ mod tests {
             output: None,
             sqlite3_bin: "sqlite3".into(),
             duckdb_bin: "duckdb".into(),
+            duckdb_memory_limit: None,
             mode: Mode::Report,
             source: "ls".into(),
         })

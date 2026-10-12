@@ -27,8 +27,8 @@ pub fn numbers<const N: usize>(data: &[u8]) -> Result<[u64; N]> {
         return Err("Invalid temporary numeric record".into());
     }
     let mut result = [0; N];
-    for (number, bytes) in result.iter_mut().zip(data.chunks_exact(8)) {
-        *number = u64::from_le_bytes(bytes.try_into()?);
+    for (number, bytes) in result.iter_mut().zip(data.as_chunks::<8>().0) {
+        *number = u64::from_le_bytes(*bytes);
     }
     Ok(result)
 }
@@ -218,17 +218,20 @@ fn snapshot_reader(mut reader: impl BufRead, options: &Options, hex: bool) -> Re
     if options.input_format == "ls" {
         crate::export::rows(reader, |row| scan.row(row), true)?;
     } else {
-        let mut line = String::new();
         if !hex {
-            reader.read_line(&mut line)?;
+            let line = crate::limits::line(&mut reader)?.ok_or("Missing TSV header")?;
             if line.trim_end_matches(['\n', '\r']) != EXPORT_COLUMNS.join("\t") {
                 return Err("Invalid TSV header: expected the 12 snapshot columns".into());
             }
         }
-        loop {
-            line.clear();
-            if reader.read_line(&mut line)? == 0 {
-                break;
+        let limit = if hex {
+            crate::limits::HEX_LINE
+        } else {
+            crate::limits::TEXT_LINE
+        };
+        while let Some(line) = crate::limits::line_with_limit(&mut reader, limit)? {
+            if line.split('\t').count() != 12 {
+                return Err("Invalid snapshot row: expected 12 columns".into());
             }
             let cells = line
                 .trim_end_matches(['\n', '\r'])

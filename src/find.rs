@@ -149,17 +149,24 @@ pub fn normalize(mut reader: impl BufRead, writer: &mut impl Write) -> Result<()
 
 fn read_record(reader: &mut impl BufRead) -> Result<Option<Vec<String>>> {
     let mut cells = Vec::with_capacity(10);
+    let mut remaining = crate::limits::FIND_RECORD;
     for index in 0..10 {
-        let mut bytes = Vec::new();
-        if reader.read_until(0, &mut bytes)? == 0 {
+        let Some((bytes, terminated)) = crate::limits::delimited(
+            reader,
+            0,
+            remaining.min(crate::limits::FIND_FIELD),
+            "Find field/record",
+        )?
+        else {
             if index == 0 {
                 return Ok(None);
             }
             return Err("Truncated find record".into());
-        }
-        if bytes.pop() != Some(0) {
+        };
+        if !terminated {
             return Err("Unterminated find field".into());
         }
+        remaining -= bytes.len();
         cells.push(String::from_utf8(bytes).map_err(|_| "find paths and metadata must be UTF-8")?);
     }
     Ok(Some(cells))

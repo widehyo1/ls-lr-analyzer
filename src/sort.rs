@@ -34,6 +34,9 @@ fn read_bytes(reader: &mut impl Read) -> io::Result<Vec<u8>> {
     reader.read_exact(&mut length)?;
     let length = usize::try_from(u64::from_le_bytes(length))
         .map_err(|_| io::Error::other("Temporary record is too large"))?;
+    if length > crate::limits::SORT_CELL {
+        return Err(io::Error::other("Temporary sort cell exceeds memory limit"));
+    }
     let mut bytes = vec![0; length];
     reader.read_exact(&mut bytes)?;
     Ok(bytes)
@@ -76,6 +79,14 @@ impl Sorter {
     }
 
     pub fn push(&mut self, record: Record) -> Result<()> {
+        if [record.key.0.len(), record.key.1.len(), record.data.len()]
+            .into_iter()
+            .any(|n| n > crate::limits::SORT_CELL)
+            || record.key.0.len() + record.key.1.len() + record.data.len()
+                > crate::limits::SORT_RECORD
+        {
+            return Err("Sort record exceeds memory limit".into());
+        }
         // Charge two struct slots per record to cover Vec's geometric capacity.
         let bytes = 2 * size_of::<Record>()
             + record.key.0.capacity()
@@ -177,6 +188,17 @@ impl Sorted {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_length_prefix_is_rejected_before_allocation() {
+        let mut reader = &u64::MAX.to_le_bytes()[..];
+        assert!(
+            read_bytes(&mut reader)
+                .unwrap_err()
+                .to_string()
+                .contains("limit")
+        );
+    }
 
     #[test]
     fn multiple_merge_passes_preserve_binary_cells_and_duplicate_keys() {

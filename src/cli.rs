@@ -21,6 +21,7 @@ pub struct Options {
     pub output: Option<PathBuf>,
     pub sqlite3_bin: PathBuf,
     pub duckdb_bin: PathBuf,
+    pub duckdb_memory_limit: Option<u64>,
     pub mode: Mode,
     pub source: String,
 }
@@ -38,9 +39,10 @@ Use - for stdin (ls/find/tsv input); at most one comparison input may be stdin.
 --output FILE         Export destination; TSV defaults to stdout
 --sqlite3-bin PATH    SQLite CLI executable (default: sqlite3 on PATH)
 --duckdb-bin PATH     DuckDB CLI for DuckDB/Parquet (default: duckdb on PATH)
+--duckdb-memory-limit SIZE  DuckDB buffer budget (default: 64MiB; not an RSS limit)
 --source SOURCE       ls (default) or find; read snapshot files or stdin
 --depth N             Report grouping depth (default: 1)
---top N               Report ranking limit (default: 10)
+--top N               Report ranking limit (default: 10; maximum: 1000)
 --days N              Report comparison interval; show average net growth
 --block-size N        Report bytes per ls total unit (default: 1024)
 --include-merged      Report includes container overlay merged views
@@ -76,6 +78,7 @@ pub fn options() -> Result<Option<Options>> {
         output: None,
         sqlite3_bin: "sqlite3".into(),
         duckdb_bin: "duckdb".into(),
+        duckdb_memory_limit: None,
         mode,
         source: "ls".into(),
     };
@@ -137,6 +140,11 @@ pub fn options() -> Result<Option<Options>> {
             "--duckdb-bin" => {
                 o.duckdb_bin = args.next().ok_or("--duckdb-bin requires a path")?.into();
             }
+            "--duckdb-memory-limit" => {
+                o.duckdb_memory_limit = Some(parse_memory_limit(
+                    &args.next().ok_or("--duckdb-memory-limit requires a size")?,
+                )?);
+            }
             _ if arg.starts_with('-') => return Err(format!("Unknown option: {arg}").into()),
             _ => o.inputs.push(arg.into()),
         }
@@ -146,6 +154,34 @@ pub fn options() -> Result<Option<Options>> {
     }
     validate(&o)?;
     Ok(Some(o))
+}
+
+impl Options {
+    #[cfg(any(feature = "sqlite", feature = "duckdb", feature = "parquet"))]
+    pub fn duckdb_memory_limit_bytes(&self) -> u64 {
+        self.duckdb_memory_limit.unwrap_or(64 * 1024 * 1024)
+    }
+}
+
+fn parse_memory_limit(value: &str) -> Result<u64> {
+    let error = "--duckdb-memory-limit requires a positive integer with unit B, KiB, MiB, GiB, KB, MB, or GB (e.g. 512MiB), within the supported byte range";
+    let digits = value.bytes().take_while(u8::is_ascii_digit).count();
+    let multiplier = match &value[digits..] {
+        "B" => 1,
+        "KiB" => 1024,
+        "MiB" => 1024 * 1024,
+        "GiB" => 1024 * 1024 * 1024,
+        "KB" => 1000,
+        "MB" => 1000 * 1000,
+        "GB" => 1000 * 1000 * 1000,
+        _ => return Err(error.into()),
+    };
+    value[..digits]
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(multiplier))
+        .filter(|&n| n > 0 && n <= (i64::MAX as u64 - 1024 * 1024 * 1024) / 4)
+        .ok_or_else(|| error.into())
 }
 
 fn check_feature(format: &str) -> Result<()> {
@@ -162,6 +198,14 @@ fn check_feature(format: &str) -> Result<()> {
 }
 
 fn validate(o: &Options) -> Result<()> {
+    if o.duckdb_memory_limit.is_some()
+        && o.format != "parquet"
+        && !(o.format == "text" && matches!(o.input_format.as_str(), "duckdb" | "parquet"))
+    {
+        return Err(
+            "--duckdb-memory-limit requires Parquet export or DuckDB/Parquet report input".into(),
+        );
+    }
     if !matches!(o.source.as_str(), "ls" | "find") {
         return Err("--source requires ls or find".into());
     }
@@ -187,6 +231,9 @@ fn validate(o: &Options) -> Result<()> {
     }
     if o.depth == 0 || o.top == 0 || o.block_size == 0 {
         return Err("depth, top, and block-size must be positive".into());
+    }
+    if o.top > 1000 {
+        return Err("--top exceeds the 1000-item memory limit".into());
     }
     if o.days.is_some_and(|n| !n.is_finite() || n <= 0.0) {
         return Err("--days must be finite and positive".into());

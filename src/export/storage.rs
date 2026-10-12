@@ -50,9 +50,9 @@ fn check_client(binary: &Path, init: &Path, query: &str) -> Result<()> {
     Ok(())
 }
 
-fn duckdb_settings(directory: &Path) -> Result<String> {
+fn duckdb_settings(directory: &Path, memory_limit: u64) -> Result<String> {
     Ok(format!(
-        "SET memory_limit='64MiB'; SET threads=1; SET temp_directory={}; ",
+        "SET memory_limit='{memory_limit}B'; SET threads=1; SET temp_directory={}; ",
         sql_path(directory)?
     ))
 }
@@ -99,15 +99,23 @@ pub fn export(options: &Options) -> Result<()> {
         &options.duckdb_bin
     };
     if options.format == "parquet" {
+        let memory_limit = options.duckdb_memory_limit_bytes();
         let probe = sql_path(&stage.0.join("probe.parquet"))?;
-        check_client(
-            binary,
-            &init,
-            &format!(
-                "COPY (SELECT 42 AS value) TO {probe} (FORMAT PARQUET); SELECT value FROM read_parquet({probe});"
-            ),
-        )?;
-        return export_parquet(input, output, &stage, &init, binary);
+        let mut command = super::guard::client(binary, &init, memory_limit)?;
+        command.args(["-csv", "-noheader", ":memory:", &format!(
+            "{}COPY (SELECT 42 AS value) TO {probe} (FORMAT PARQUET); SELECT value FROM read_parquet({probe});",
+            duckdb_settings(&stage.0, memory_limit)?
+        )]).stdin(Stdio::null());
+        let (status, stdout, stderr) = execute(command, &stage.0)
+            .map_err(|e| format!("Cannot execute {}: {e}", binary.display()))?;
+        if !status.success() || stdout != "42" {
+            return Err(format!(
+                "{} capability check failed: {status} {stderr}",
+                binary.display()
+            )
+            .into());
+        }
+        return export_parquet(input, output, &stage, &init, options);
     }
     check_client(binary, &init, "SELECT 42;")?;
 
@@ -153,66 +161,130 @@ fn export_parquet(
     output: &Path,
     stage: &Staging,
     init: &Path,
-    binary: &Path,
+    options: &Options,
 ) -> Result<()> {
-    // Hex cells have no delimiters, quotes or newlines. Bulk-read once rather
-    // than issuing hundreds of thousands of individually planned INSERTs.
-    let rows = stage.0.join("rows.hex.tsv");
-    let mut writer = BufWriter::new(File::create(&rows)?);
-    let mut index = 0_u64;
-    export_rows(input, |row| {
-        index += 1;
-        write!(writer, "{index}")?;
+    let mut batches = Batches::new(stage, init, options)?;
+    export_rows(input, |row| batches.row(row))?;
+    if batches.count != 0 || batches.index == 0 {
+        batches.flush()?;
+    }
+    batches.joiner.finish()?;
+    fs::hard_link(stage.0.join("snapshot.parquet"), output)?;
+    Ok(())
+}
+
+struct Batches<'a> {
+    stage: &'a Staging,
+    init: &'a Path,
+    options: &'a Options,
+    writer: BufWriter<File>,
+    joiner: super::parquet::Joiner,
+    index: u64,
+    count: usize,
+    bytes: usize,
+}
+
+impl<'a> Batches<'a> {
+    fn new(stage: &'a Staging, init: &'a Path, options: &'a Options) -> Result<Self> {
+        Ok(Self {
+            stage,
+            init,
+            options,
+            writer: BufWriter::new(File::create(stage.0.join("rows.hex.tsv"))?),
+            joiner: super::parquet::Joiner::new(
+                &stage.0.join("snapshot.parquet"),
+                &stage.0.join("row-groups.thrift"),
+            )?,
+            index: 0,
+            count: 0,
+            bytes: 0,
+        })
+    }
+
+    fn row(&mut self, row: &[&str; 12]) -> Result<()> {
+        let length = 45 + row.iter().map(|cell| cell.len() * 2).sum::<usize>();
+        let budget = usize::try_from(
+            (self.options.duckdb_memory_limit_bytes() / 16).clamp(4096, 4 * 1024 * 1024),
+        )?;
+        if self.count != 0
+            && (self.count == super::parquet::BATCH_ROWS || self.bytes + length > budget)
+        {
+            self.flush()?;
+        }
+        if length > 2 * crate::limits::SORT_CELL {
+            return Err("Encoded export row exceeds memory limit".into());
+        }
+        self.index = self
+            .index
+            .checked_add(1)
+            .filter(|&n| n <= i64::MAX as u64)
+            .ok_or("Export row count overflow")?;
+        write!(self.writer, "{}", self.index)?;
         for cell in row {
-            write!(writer, "\t")?;
-            // A prefix distinguishes an empty string from CSV NULL.
-            write!(writer, "x")?;
+            write!(self.writer, "\tx")?;
             for byte in cell.as_bytes() {
-                write!(writer, "{byte:02x}")?;
+                write!(self.writer, "{byte:02x}")?;
             }
         }
-        writeln!(writer)?;
+        writeln!(self.writer)?;
+        self.count += 1;
+        self.bytes += length;
         Ok(())
-    })?;
-    writer.flush()?;
-    drop(writer);
-    let artifact = stage.0.join("snapshot.parquet");
-    let mut columns = String::new();
-    let mut projection = String::new();
-    let mut empty = String::new();
-    for column in EXPORT_COLUMNS {
-        write!(columns, ", '{column}': 'VARCHAR'")?;
-        write!(
-            projection,
-            ", decode(unhex(substr(\"{column}\", 2))) AS \"{column}\""
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        let rows = self.stage.0.join("rows.hex.tsv");
+        self.writer.flush()?;
+        let artifact = self.stage.0.join("batch.parquet");
+        let mut columns = String::new();
+        let mut projection = String::new();
+        let mut empty = String::new();
+        for column in EXPORT_COLUMNS {
+            write!(columns, ", '{column}': 'VARCHAR'")?;
+            write!(
+                projection,
+                ", decode(unhex(substr(\"{column}\", 2))) AS \"{column}\""
+            )?;
+            write!(empty, ", CAST('' AS VARCHAR) AS \"{column}\"")?;
+        }
+        let query = if self.count == 0 {
+            format!("SELECT CAST(0 AS BIGINT) AS row_index{empty} WHERE FALSE")
+        } else {
+            format!(
+                "SELECT row_index{projection} FROM read_csv({}, delim='\\t', header=false, auto_detect=false, columns={{'row_index': 'BIGINT'{columns}}}, quote='', escape='') ORDER BY row_index",
+                sql_path(&rows)?
+            )
+        };
+        let mut command = super::guard::client(
+            &self.options.duckdb_bin,
+            self.init,
+            self.options.duckdb_memory_limit_bytes(),
         )?;
-        write!(empty, ", CAST('' AS VARCHAR) AS \"{column}\"")?;
+        command
+            .args([
+                ":memory:",
+                &format!(
+                    "{}COPY ({query}) TO {} (FORMAT PARQUET);",
+                    duckdb_settings(&self.stage.0, self.options.duckdb_memory_limit_bytes())?,
+                    sql_path(&artifact)?
+                ),
+            ])
+            .stdin(Stdio::null());
+        let (status, _, stderr) = execute(command, &self.stage.0)?;
+        if !status.success() {
+            return Err(format!(
+                "{} export failed: {status} {stderr}",
+                self.options.duckdb_bin.display()
+            )
+            .into());
+        }
+        self.joiner.append(&artifact)?;
+        fs::remove_file(artifact)?;
+        self.writer = BufWriter::new(File::create(rows)?);
+        self.count = 0;
+        self.bytes = 0;
+        Ok(())
     }
-    let query = if index == 0 {
-        format!("SELECT CAST(0 AS BIGINT) AS row_index{empty} WHERE FALSE")
-    } else {
-        format!(
-            "SELECT row_index{projection} FROM read_csv({}, delim='\\t', header=false, auto_detect=false, columns={{'row_index': 'BIGINT'{columns}}}, quote='', escape='') ORDER BY row_index",
-            sql_path(&rows)?
-        )
-    };
-    let mut command = client(binary, init);
-    command
-        .args([
-            ":memory:",
-            &format!(
-                "{}COPY ({query}) TO {} (FORMAT PARQUET);",
-                duckdb_settings(&stage.0)?,
-                sql_path(&artifact)?
-            ),
-        ])
-        .stdin(Stdio::null());
-    let (status, _, stderr) = execute(command, &stage.0)?;
-    if !status.success() {
-        return Err(format!("{} export failed: {status} {stderr}", binary.display()).into());
-    }
-    fs::hard_link(artifact, output)?;
-    Ok(())
 }
 
 struct RowFile {
@@ -262,12 +334,16 @@ pub fn read_rows(path: &Path, options: &Options) -> Result<Box<dyn BufRead>> {
         if sqlite {
             String::new()
         } else {
-            duckdb_settings(&stage.0)?
+            duckdb_settings(&stage.0, options.duckdb_memory_limit_bytes())?
         }
     );
     let rows = stage.0.join("rows.hex");
     let errors = stage.0.join("stderr.txt");
-    let mut command = client(binary, &init);
+    let mut command = if sqlite {
+        client(binary, &init)
+    } else {
+        super::guard::client(binary, &init, options.duckdb_memory_limit_bytes())?
+    };
     command.args(["-list", "-noheader"]);
     if options.input_format == "parquet" {
         command.arg(":memory:");

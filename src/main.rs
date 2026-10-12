@@ -4,6 +4,7 @@ mod cli;
 mod export;
 mod find;
 mod input;
+mod limits;
 mod report;
 mod sort;
 mod top;

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.6
+
+- Reject oversized stdin/file fields and lines before unbounded allocation; bound temporary sort records and report ranking counts.
+- Add `--duckdb-memory-limit SIZE` for Parquet export and DuckDB/Parquet report input (default: 64 MiB).
+- Export Parquet through bounded DuckDB batches while retaining engine-default CSV buffers.
+- Join batches into one Parquet file with relocated offsets and a disk-spooled footer; preserve all cells and row order.
+- Apply a Linux address-space ceiling to every DuckDB child, including capability checks, and refuse unguarded execution on other platforms.
+- Preserve atomic publication and remove partial batches on ordinary failures.
+- Require Rust 1.99 and test oversized open stdin, multi-batch output, budget propagation, and failure cleanup.
+
 ## 0.1.5
 
 - Accept `-` for streamed ls, find, and TSV report input with bounded memory.

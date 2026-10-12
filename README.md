@@ -42,7 +42,8 @@ ls-lr-analyzer before.txt after.txt
 ### Install options
 
 The default build provides text reports and TSV export, with no external runtime
-tools and no third-party crates. Enable optional file formats with Cargo features:
+tools and no third-party crates. Building requires Rust 1.99 or newer. Optional
+database features use `libc` for process resource limits. Enable file formats with Cargo features:
 
 ```bash
 # Enable selected formats.
@@ -302,11 +303,35 @@ For Parquet, replace `snapshot` with `read_parquet('snapshot.parquet')` in DuckD
 
 DuckDB database export is no longer offered. Existing DuckDB snapshots remain
 readable with the `duckdb` feature. Parquet export bulk-loads a temporary
-hex-encoded TSV in DuckDB's `:memory:` database, then writes Parquet directly;
-it does not create a database file or issue per-row INSERT statements. The
-temporary TSV still requires disk space. DuckDB export and report queries use
-a 64 MiB working-memory limit, one worker thread, and a temporary spill directory.
-This limit does not include all of DuckDB's process overhead.
+hex-encoded TSV in bounded batches in DuckDB's `:memory:` database. Each batch
+contains at most 8,192 rows and targets at most `min(memory_limit / 16, 4 MiB)`
+of encoded data, with a 4 KiB minimum target. A single bounded row may exceed
+that target. CSV buffers use the engine defaults; there is no CSV buffer option.
+Batch column data is copied into one final Parquet file. Its row-group footer
+metadata is spooled to disk, so increasing the input does not grow a footer
+collection in memory. Sorting is limited to individual batches and preserves
+global `row_index` and physical row order. No database file or per-row INSERTs
+are used.
+
+DuckDB uses one worker, a disk spill directory, and a buffer-manager budget of
+64 MiB by default. Override the budget for both export and database/Parquet reports:
+
+```bash
+cat snapshot.find | ls-lr-analyzer export --input-format find --format parquet \
+  --duckdb-memory-limit 256MiB --output snapshot.parquet -
+ls-lr-analyzer report --input-format parquet --duckdb-memory-limit 256MiB snapshot.parquet
+```
+
+Sizes are positive integers with `B`, `KiB`, `MiB`, `GiB`, `KB`, `MB`, or `GB` units.
+The option is rejected for paths that do not use DuckDB. It is not an RSS limit:
+vectors and other engine allocations can exist outside the buffer manager.
+Every DuckDB child, including capability probes, receives a Linux `RLIMIT_AS`
+ceiling of `1 GiB + 4 * memory_limit`, or any lower inherited address-space limit.
+This also bounds allocations outside DuckDB's buffer manager. It limits virtual
+address space, not a reservation of that much RAM. DuckDB execution currently
+requires Linux; unsupported platforms fail rather than silently running without
+the guard. A too-small budget or ceiling can fail the export cleanly. The
+program never raises the configured budget automatically.
 SQLite export uses temporary SQL and a staged database; Parquet uses a staged
 hex-encoded TSV and Parquet file beside the destination. Allow disk space for
 these intermediate files. The
@@ -402,8 +427,23 @@ values. Comparison merge-joins records by relative directory and filename, even
 when snapshot directory order or root labels differ. Empty directories and
 duplicate-path validation are preserved.
 
-The buffer budget is not a hard RSS limit: allocator overhead, merge readers,
-the largest individual record, and the selected `--top` also require memory.
+Input bounds apply identically to stdin and files: find fields are limited to
+64 KiB each and 256 KiB per record (excluding NUL separators); ls/TSV input
+and generated escaped TSV rows are limited to 256 KiB, while the internal hex
+report transport allows 2 MiB (all excluding the newline). Oversized data is rejected
+while reading, without waiting for EOF or first allocating the entire field.
+Internal sort cells are limited to 1 MiB and records to 2 MiB. `--top` is limited
+to 1,000 items. These limits include long paths and decoded metadata; inputs that
+exceed them require a different collection/normalization policy.
+
+The 8 MiB sort budget is not a hard RSS limit: allocator overhead, merge readers,
+bounded individual records, and the selected `--top` also require memory.
+For stdin-to-Parquet export, Rust retains fixed-size parser/sort/footer state,
+and at most one guarded DuckDB child runs at a time. Neither input record count
+nor the final Parquet row-group count creates a growing in-memory collection.
+The final footer has Parquet's 32-bit length limit; exceeding that format limit
+fails without publishing a partial output. Ordinary files and disk capacity are
+still finite, so bounded memory does not promise completion for every input.
 Temporary disk usage scales with input size. Choose a disk-backed temporary
 directory with enough free space; a tmpfs uses system RAM:
 
